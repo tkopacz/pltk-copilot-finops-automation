@@ -1,0 +1,153 @@
+# Schema test cases for schemas/v1/cost-center-members.schema.json.
+#
+# One case file per (version, schema): the version is the parent directory
+# (v1), the schema is the file name (cost-center-members). The runner discovers
+# tests/cases/v*/ and validates each case's `config` against the matching
+# schemas/<version>/<schema>.schema.json.
+#
+# Each case:
+#   name         short identifier shown in test output
+#   valid        true  -> config MUST pass the schema
+#                false -> config MUST be rejected by the schema
+#   expect_error (invalid cases only) substring that must appear in the
+#                validator output, so a case cannot fail for the wrong reason
+#   config       the config document to validate
+#
+# Add a case by appending to this list. See AGENTS.md "Schema Tests".
+
+cases:
+  # ── valid ──────────────────────────────────────────────────────────────────
+  - name: org-strict-sync
+    valid: true
+    config:
+      enterprise_slug: your-enterprise
+      mappings:
+        - name: cc-org-your-org-platform-engineering
+          description: Keep org team platform-engineering exactly in sync with its cost center.
+          source:
+            org: your-org
+            team_slug: platform-engineering
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          sync:
+            remove_extra_members: true
+            batch_size: 50
+
+  - name: enterprise-additive
+    valid: true
+    config:
+      # Minimal enterprise team mapping (only required source/target).
+      mappings:
+        - source:
+            enterprise: your-enterprise
+            team_slug: ai-leads
+          target:
+            cost_center: cc-ent-your-enterprise-ai-leads
+
+  - name: empty
+    valid: true
+    config:
+      # Safe no-op config.
+      enterprise_slug: your-enterprise
+      mappings: []
+
+  - name: version-1-batch-min
+    valid: true
+    config:
+      # Explicit version marker + boundary batch_size (1 is the minimum).
+      version: 1
+      mappings:
+        - source:
+            org: your-org
+            team_slug: platform-engineering
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          sync:
+            batch_size: 1
+
+  # ── invalid ─────────────────────────────────────────────────────────────────
+  - name: missing-team-slug
+    valid: false
+    expect_error: "'team_slug' is a required property"
+    config:
+      mappings:
+        - source:
+            org: your-org
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+
+  - name: missing-target
+    valid: false
+    expect_error: "'target' is a required property"
+    config:
+      mappings:
+        - source:
+            enterprise: your-enterprise
+            team_slug: ai-leads
+
+  - name: missing-source
+    valid: false
+    expect_error: "'source' is a required property"
+    config:
+      mappings:
+        - target:
+            cost_center: cc-org-your-org-platform-engineering
+
+  - name: batch-size-too-big
+    valid: false
+    expect_error: "greater than the maximum"
+    config:
+      mappings:
+        - source:
+            org: your-org
+            team_slug: platform-engineering
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          sync:
+            batch_size: 99
+
+  - name: batch-size-zero
+    valid: false
+    expect_error: "less than the minimum"
+    config:
+      mappings:
+        - source:
+            org: your-org
+            team_slug: platform-engineering
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          sync:
+            batch_size: 0
+
+  - name: typo-sync-field
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      # Misspelled sync field — additionalProperties:false catches the typo.
+      mappings:
+        - source:
+            org: your-org
+            team_slug: platform-engineering
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          sync:
+            remove_extra_member: true
+
+  - name: missing-mappings-key
+    valid: false
+    expect_error: "'mappings' is a required property"
+    config:
+      enterprise_slug: your-enterprise
+
+  - name: unknown-mapping-field
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      # Unknown mapping field.
+      mappings:
+        - source:
+            org: your-org
+            team_slug: platform-engineering
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          schedule: daily

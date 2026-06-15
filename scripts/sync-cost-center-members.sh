@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ENTERPRISE_SLUG=""
-CONFIG_FILE="config/cost-center-members.example.yml"
+ENTERPRISE_SLUG_CLI=""
+CONFIG_FILE="config/copilot-finops.example.yml"
 MAPPING_NAME=""
 DRY_RUN="true"
 
@@ -10,6 +11,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --enterprise-slug)
       ENTERPRISE_SLUG="$2"
+      ENTERPRISE_SLUG_CLI="$2"
       shift 2
       ;;
     --config-file)
@@ -36,14 +38,30 @@ if ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! comma
   exit 1
 fi
 
-scripts/validate-config.sh "$CONFIG_FILE" teams >/dev/null
+# v2 merges budgets + member mappings into one file and renames the vocab; it is
+# validated with type 'all'. v1 keeps the split cost-center-members file. Detect
+# the version once and branch the validation + per-mapping field reads.
+CONFIG_VERSION="$(yq eval '.version // 1' "$CONFIG_FILE")"
+
+if [[ "$CONFIG_VERSION" == "2" ]]; then
+  scripts/validate-config.sh "$CONFIG_FILE" all >/dev/null
+else
+  scripts/validate-config.sh "$CONFIG_FILE" teams >/dev/null
+fi
 
 if [[ -z "$ENTERPRISE_SLUG" ]]; then
   ENTERPRISE_SLUG="$(yq eval '.enterprise_slug // ""' "$CONFIG_FILE")"
 fi
 
+# v2 allows a per-entry enterprise: as a "no top-level slug" convenience. When no
+# CLI / top-level slug is set, fall back to the first per-entry enterprise so the
+# cost center endpoints still resolve (rule 9: one must resolve at runtime).
+if [[ -z "$ENTERPRISE_SLUG" && "$CONFIG_VERSION" == "2" ]]; then
+  ENTERPRISE_SLUG="$(yq eval '[.team_cost_center_mappings[].enterprise] | map(select(. != null and . != "")) | .[0] // ""' "$CONFIG_FILE")"
+fi
+
 if [[ -z "$ENTERPRISE_SLUG" ]]; then
-  echo "ERROR: enterprise slug is required via --enterprise-slug or config.enterprise_slug" >&2
+  echo "ERROR: enterprise slug is required via --enterprise-slug, config.enterprise_slug, or a per-entry enterprise:" >&2
   exit 1
 fi
 
@@ -64,6 +82,20 @@ team_source_label() {
     printf 'enterprise team %s/%s' "$source_enterprise" "$team_slug"
   else
     printf 'org team %s/%s' "$source_org" "$team_slug"
+  fi
+}
+
+# Effective enterprise slug for a v2 mapping's enterprise-team membership reads:
+# CLI --enterprise-slug wins, then the per-entry enterprise:, then the run-level
+# slug. organization: switches the source to an org team instead.
+resolve_entry_enterprise() {
+  local entry_ent="$1"
+  if [[ -n "$ENTERPRISE_SLUG_CLI" ]]; then
+    printf '%s' "$ENTERPRISE_SLUG_CLI"
+  elif has_value "$entry_ent"; then
+    printf '%s' "$entry_ent"
+  else
+    printf '%s' "$ENTERPRISE_SLUG"
   fi
 }
 
@@ -174,7 +206,11 @@ batch_apply() {
   done
 }
 
-mapping_count="$(yq eval '.mappings | length' "$CONFIG_FILE")"
+if [[ "$CONFIG_VERSION" == "2" ]]; then
+  mapping_count="$(yq eval '(.team_cost_center_mappings // []) | length' "$CONFIG_FILE")"
+else
+  mapping_count="$(yq eval '(.mappings // []) | length' "$CONFIG_FILE")"
+fi
 if [[ "$mapping_count" -eq 0 ]]; then
   echo "No mappings found in $CONFIG_FILE"
   exit 0
@@ -183,15 +219,35 @@ fi
 failures=0
 echo "Starting sync for enterprise '$ENTERPRISE_SLUG' (dry_run=$DRY_RUN)"
 for ((i = 0; i < mapping_count; i++)); do
-  name="$(yq eval ".mappings[$i].name // \"mapping-$i\"" "$CONFIG_FILE")"
-  [[ -n "$MAPPING_NAME" && "$name" != "$MAPPING_NAME" ]] && continue
-
-  source_org="$(yq eval ".mappings[$i].source.org // \"\"" "$CONFIG_FILE")"
-  source_enterprise="$(yq eval ".mappings[$i].source.enterprise // \"\"" "$CONFIG_FILE")"
-  team_slug="$(yq eval ".mappings[$i].source.team_slug" "$CONFIG_FILE")"
-  cost_center="$(yq eval ".mappings[$i].target.cost_center" "$CONFIG_FILE")"
-  remove_extra="$(yq eval ".mappings[$i].sync.remove_extra_members // false" "$CONFIG_FILE")"
-  batch_size="$(yq eval ".mappings[$i].sync.batch_size // 50" "$CONFIG_FILE")"
+  if [[ "$CONFIG_VERSION" == "2" ]]; then
+    # v2 vocab: team/organization/enterprise/cost_center/remove_extra_members.
+    # batch_size is not a v2 surface field; it stays an internal default of 50.
+    name="$(yq eval ".team_cost_center_mappings[$i].name // \"mapping-$i\"" "$CONFIG_FILE")"
+    [[ -n "$MAPPING_NAME" && "$name" != "$MAPPING_NAME" ]] && continue
+    m_org="$(yq eval ".team_cost_center_mappings[$i].organization // \"\"" "$CONFIG_FILE")"
+    m_entry_ent="$(yq eval ".team_cost_center_mappings[$i].enterprise // \"\"" "$CONFIG_FILE")"
+    team_slug="$(yq eval ".team_cost_center_mappings[$i].team // \"\"" "$CONFIG_FILE")"
+    cost_center="$(yq eval ".team_cost_center_mappings[$i].cost_center // \"\"" "$CONFIG_FILE")"
+    remove_extra="$(yq eval ".team_cost_center_mappings[$i].remove_extra_members // false" "$CONFIG_FILE")"
+    batch_size=50
+    if has_value "$m_org"; then
+      source_org="$m_org"
+      source_enterprise=""
+    else
+      source_org=""
+      source_enterprise="$(resolve_entry_enterprise "$m_entry_ent")"
+    fi
+  else
+    # v1 vocab: source.org / source.enterprise / source.team_slug / target.cost_center / sync.*.
+    name="$(yq eval ".mappings[$i].name // \"mapping-$i\"" "$CONFIG_FILE")"
+    [[ -n "$MAPPING_NAME" && "$name" != "$MAPPING_NAME" ]] && continue
+    source_org="$(yq eval ".mappings[$i].source.org // \"\"" "$CONFIG_FILE")"
+    source_enterprise="$(yq eval ".mappings[$i].source.enterprise // \"\"" "$CONFIG_FILE")"
+    team_slug="$(yq eval ".mappings[$i].source.team_slug" "$CONFIG_FILE")"
+    cost_center="$(yq eval ".mappings[$i].target.cost_center" "$CONFIG_FILE")"
+    remove_extra="$(yq eval ".mappings[$i].sync.remove_extra_members // false" "$CONFIG_FILE")"
+    batch_size="$(yq eval ".mappings[$i].sync.batch_size // 50" "$CONFIG_FILE")"
+  fi
 
   # Validate required fields
   if ! has_value "$team_slug"; then

@@ -1,5 +1,13 @@
+# DEPRECATED (v1 split file). The tracked default is now config/copilot-finops.yml (v2 merged).
+# v1 is frozen but still supported: this file still validates (schemas/v1/) and the per-type
+# workflows still accept it via the budget_policies_config_file input. Migrate to v2 with
+# scripts/migrate-v1-to-v2.sh. See schemas/README.md (#v1-schemas-frozen).
+
 # Public-safe starter config.
 # Replace your-enterprise and add policies in your private fork before applying.
+
+# Config schema version (optional; defaults to 1). See schemas/README.md.
+version: 1
 enterprise_slug: your-enterprise
 
 # Keep this list empty until you are ready to create or update budgets.

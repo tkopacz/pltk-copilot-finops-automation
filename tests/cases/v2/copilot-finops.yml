@@ -1,0 +1,903 @@
+# Schema test cases for schemas/v2/copilot-finops.schema.json.
+#
+# One case file per (version, schema): the version is the parent directory
+# (v2), the schema is the file name (copilot-finops). The runner discovers
+# tests/cases/v*/ and validates each case's `config` against the matching
+# schemas/<version>/<schema>.schema.json.
+#
+# v2 merges the two v1 files into one document AND moves the structural
+# cross-field rules into the schema, so this manifest exercises both plain shape
+# (types/enums/typos) and those structural rules. Both lists
+# (ai_credit_spend_policies, team_cost_center_mappings) are OPTIONAL — only
+# version is required; write just the part you need. Because the schema now
+# enforces the budget-policy baseline cardinality (a NON-EMPTY
+# ai_credit_spend_policies must contain exactly one all_users policy, with at
+# most one optional enterprise policy — schema rule 10, via contains +
+# minContains/maxContains, draft 2020-12), the focused valid cases below carry an
+# all_users default (and usually an enterprise cap) alongside the policy under
+# test. Runtime-only rules (9 = enterprise slug resolution, L = live cost
+# center/team data) and value defaulting (D) stay in scripts/validate-config.sh
+# and the apply/sync scripts; the `schema-allows-runtime-only-rule` case below
+# guards that boundary.
+#
+# Each case:
+#   name         short identifier shown in test output
+#   valid        true  -> config MUST pass the schema
+#                false -> config MUST be rejected by the schema
+#   expect_error (invalid cases only) substring that must appear in the
+#                validator output, so a case cannot fail for the wrong reason
+#   config       the config document to validate
+#
+# Add a case by appending to this list. See AGENTS.md "Schema Tests".
+
+cases:
+  # ── valid ──────────────────────────────────────────────────────────────────
+  - name: empty
+    valid: true
+    config:
+      # Safe no-op config: both lists present and empty. An empty policy list is
+      # exempt from the baseline cardinality rule.
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies: []
+      team_cost_center_mappings: []
+
+  - name: version-only-noop
+    valid: true
+    config:
+      # Both lists optional: version alone is a valid no-op.
+      version: 2
+      enterprise_slug: your-enterprise
+
+  - name: policies-baseline-only
+    valid: true
+    config:
+      # A complete baseline: the required all_users default plus the optional
+      # (at most one) enterprise cap.
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: policies-all-users-only-no-enterprise
+    valid: true
+    config:
+      # enterprise is optional: an all_users default alone is a valid budget set.
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: policies-only-no-mappings-key
+    valid: true
+    config:
+      # Only budgets; team_cost_center_mappings omitted entirely. Baseline pair present.
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - name: budget-all-users-default
+          scope: all_users
+          amount: 50
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+
+  - name: mappings-only-no-policies-key
+    valid: true
+    config:
+      # Only member sync; ai_credit_spend_policies omitted entirely (no baseline needed).
+      version: 2
+      enterprise_slug: your-enterprise
+      team_cost_center_mappings:
+        - team: ai-leads
+          cost_center: cc-ent-your-enterprise-ai-leads
+
+  - name: all-users
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - name: budget-all-users-default
+          scope: all_users
+          description: Default per-user AI-credit budget for all licensed users.
+          amount: 50
+          stop_at_limit: true
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: enterprise
+    valid: true
+    config:
+      version: 2
+      ai_credit_spend_policies:
+        - name: budget-ent-total
+          scope: enterprise
+          amount: 5000
+          stop_at_limit: false
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: cost-center
+    valid: true
+    config:
+      version: 2
+      ai_credit_spend_policies:
+        - name: budget-cc-platform
+          scope: cost_center
+          cost_center: cc-org-your-org-platform-engineering
+          amount: 200
+          # cost_center budgets may alert-only, so stop_at_limit: false is allowed.
+          stop_at_limit: false
+        # Required baseline pair.
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: team-pool-then-metered-enterprise
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - name: budget-team-ent-copilot-champions
+          scope: team
+          teams: [copilot-champions]
+          credit_scope: pool_then_metered
+          amount: 150
+          stop_at_limit: true
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: team-metered-only-derived-cc
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # metered_only with no cost_center (derived + auto-created at apply time).
+        - name: budget-team-ent-data-science
+          scope: team
+          teams: [data-science]
+          credit_scope: metered_only
+          amount: 300
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: team-metered-only-explicit-cc
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # metered_only with an explicit cost_center destination.
+        - name: budget-team-ent-ai-leads
+          scope: team
+          teams: [ai-leads]
+          credit_scope: metered_only
+          cost_center: cc-ent-your-enterprise-ai-leads
+          amount: 500
+          stop_at_limit: false
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: team-metered-only-remove-extra
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # remove_extra_members is allowed ONLY here: team + metered_only.
+        - name: budget-team-ent-ml-platform
+          scope: team
+          teams: [ml-platform]
+          credit_scope: metered_only
+          amount: 250
+          remove_extra_members: true
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: org-team-budget
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # organization: present marks an org team source (valid with scope: team).
+        - name: budget-team-org-platform-engineering
+          scope: team
+          organization: your-org
+          teams: [platform-engineering]
+          credit_scope: pool_then_metered
+          amount: 100
+          stop_at_limit: true
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: org-scope-pool-then-metered
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # scope: organization + pool_then_metered -> per-member user budgets (always hard-stop).
+        - name: budget-org-your-org-per-member
+          scope: organization
+          organization: your-org
+          credit_scope: pool_then_metered
+          amount: 80
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: org-scope-metered-only
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # scope: organization + metered_only -> one org-scope budget (no cost center).
+        - name: budget-org-your-org-total
+          scope: organization
+          organization: your-org
+          credit_scope: metered_only
+          amount: 2000
+          stop_at_limit: false
+          alert_admins:
+            - your-org-owner
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: user-budget
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # scope: user -> one hard-stop budget per login in the users list.
+        - name: budget-user-power-users
+          scope: user
+          users: [octocat, monalisa]
+          amount: 75
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: multi-team-pool-then-metered
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        # One policy applied to several teams; members are unioned + deduped.
+        - name: budget-team-ent-multi
+          scope: team
+          teams: [copilot-champions, ai-leads]
+          credit_scope: pool_then_metered
+          amount: 120
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: enterprise-override-per-entry
+    valid: true
+    config:
+      # No top-level enterprise_slug; a per-entry enterprise: override instead.
+      version: 2
+      ai_credit_spend_policies:
+        - name: budget-ent-other
+          scope: enterprise
+          enterprise: another-enterprise
+          amount: 1000
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: alerting
+    valid: true
+    config:
+      version: 2
+      ai_credit_spend_policies:
+        - name: budget-ent-total
+          scope: enterprise
+          amount: 5000
+          alert_admins:
+            - billing-admin
+            - finops-lead
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: mappings-enterprise-and-org
+    valid: true
+    config:
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies: []
+      team_cost_center_mappings:
+        # Enterprise team source (enterprise inferred from top-level / CLI).
+        - name: cc-ent-your-enterprise-ai-leads
+          team: ai-leads
+          cost_center: cc-ent-your-enterprise-ai-leads
+        # Org team source (organization: present), strict reconcile.
+        - name: cc-org-your-org-platform-engineering
+          organization: your-org
+          team: platform-engineering
+          cost_center: cc-org-your-org-platform-engineering
+          remove_extra_members: true
+
+  - name: api-overrides
+    valid: true
+    config:
+      # The optional api: block must be allowed even though example configs do
+      # not showcase it. Scripts read these keys.
+      version: 2
+      enterprise_slug: your-enterprise
+      api:
+        budgets_endpoint_template: /enterprises/{enterprise}/settings/billing/budgets
+        cost_centers_list_endpoint_template: /enterprises/{enterprise}/settings/billing/cost-centers
+        cost_center_endpoint_template: /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}
+        cost_center_resource_endpoint_template: /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}/resource
+      ai_credit_spend_policies:
+        - { name: budget-ent-total, scope: enterprise, amount: 1000 }
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  - name: schema-allows-runtime-only-rule
+    valid: true
+    config:
+      # Structurally valid, but no enterprise_slug top-level and no per-entry
+      # enterprise: — the slug can only resolve from --enterprise-slug at
+      # runtime (rule 9). The schema ACCEPTS this; scripts/validate-config.sh
+      # and the apply/sync scripts own that runtime/live check. This guards the
+      # hybrid boundary: the schema must not be tightened to enforce runtime or
+      # live-data rules (9 / L). The baseline pair is present so only the
+      # runtime-only gap (no resolvable slug) distinguishes this case.
+      version: 2
+      ai_credit_spend_policies:
+        - { name: budget-ent-total, scope: enterprise, amount: 1000 }
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+      team_cost_center_mappings: []
+
+  # ── invalid: baseline cardinality (schema rule 10, draft 2020-12) ────────────
+  - name: policies-missing-all-users
+    valid: false
+    expect_error: "does not contain items matching the given schema"
+    config:
+      # Non-empty list with an enterprise cap but no all_users default.
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  - name: policies-two-enterprise
+    valid: false
+    expect_error: "Too many items match the given schema"
+    config:
+      # Only one enterprise budget is allowed (one enterprise entity).
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+        - { name: budget-ent-extra, scope: enterprise, amount: 6000 }
+      team_cost_center_mappings: []
+
+  - name: policies-two-all-users
+    valid: false
+    expect_error: "Too many items match the given schema"
+    config:
+      # Only one all_users default is allowed.
+      version: 2
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies:
+        - { name: budget-all-users-default, scope: all_users, amount: 30 }
+        - { name: budget-all-users-extra, scope: all_users, amount: 40 }
+        - { name: budget-ent-total, scope: enterprise, amount: 5000 }
+      team_cost_center_mappings: []
+
+  # ── invalid: plain shape (types / enums / typos / required) ──────────────────
+  - name: missing-version
+    valid: false
+    expect_error: "'version' is a required property"
+    config:
+      # version is the only required top-level key.
+      enterprise_slug: your-enterprise
+      ai_credit_spend_policies: []
+      team_cost_center_mappings: []
+
+  - name: bad-version
+    valid: false
+    expect_error: "was expected"
+    config:
+      # version must be 2 (const) for this schema.
+      version: 1
+      ai_credit_spend_policies: []
+      team_cost_center_mappings: []
+
+  - name: unknown-top-level-key
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      version: 2
+      extra_unknown_key: true
+
+  - name: old-key-budget-policies
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      # The v1 key was renamed; the old name is now an unknown property.
+      version: 2
+      budget_policies: []
+
+  - name: old-coverage-field
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      # coverage was renamed to credit_scope; the old field name is now unknown.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering]
+          coverage: total_spend
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: bad-scope-enum
+    valid: false
+    expect_error: "is not valid under any of the given schemas"
+    config:
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprize
+          amount: 5
+      team_cost_center_mappings: []
+
+  - name: bad-credit-scope-enum
+    valid: false
+    expect_error: "is not valid under any of the given schemas"
+    config:
+      # old value total_spend is no longer valid; credit_scope is pool_then_metered|metered_only.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering]
+          credit_scope: total_spend
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: negative-amount
+    valid: false
+    expect_error: "less than the minimum"
+    config:
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+          amount: -3
+      team_cost_center_mappings: []
+
+  - name: amount-not-integer
+    valid: false
+    expect_error: "is not of type"
+    config:
+      # Quoted value is a string; amount must be an integer.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+          amount: "100"
+      team_cost_center_mappings: []
+
+  - name: missing-amount
+    valid: false
+    expect_error: "'amount' is a required property"
+    config:
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+      team_cost_center_mappings: []
+
+  - name: typo-budget-field
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      # Misspelled field — additionalProperties:false catches the typo.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: all_users
+          amount: 10
+          stop_at_limmit: true
+      team_cost_center_mappings: []
+
+  - name: missing-mapping-cost-center
+    valid: false
+    expect_error: "'cost_center' is a required property"
+    config:
+      version: 2
+      team_cost_center_mappings:
+        - team: ai-leads
+
+  - name: missing-mapping-team
+    valid: false
+    expect_error: "'team' is a required property"
+    config:
+      version: 2
+      team_cost_center_mappings:
+        - cost_center: cc-ent-your-enterprise-ai-leads
+
+  - name: unknown-mapping-field
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      version: 2
+      team_cost_center_mappings:
+        - team: platform-engineering
+          cost_center: cc-org-your-org-platform-engineering
+          batch_size: 50
+
+  # ── invalid: structural cross-field rules (schema-enforced in v2) ────────────
+  - name: team-missing-credit-scope
+    valid: false
+    expect_error: "'credit_scope' is a required property"
+    config:
+      # scope: team requires teams AND credit_scope.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering]
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: cost-center-missing-cost-center
+    valid: false
+    expect_error: "'cost_center' is a required property"
+    config:
+      # scope: cost_center requires cost_center.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: cost_center
+          amount: 200
+      team_cost_center_mappings: []
+
+  - name: cost-center-with-team
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # scope: cost_center forbids teams.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: cost_center
+          cost_center: cc-org-your-org-platform-engineering
+          teams: [platform-engineering]
+          amount: 200
+      team_cost_center_mappings: []
+
+  - name: all-users-stop-at-limit-false
+    valid: false
+    expect_error: "was expected"
+    config:
+      # scope: all_users forces stop_at_limit: true.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: all_users
+          amount: 50
+          stop_at_limit: false
+      team_cost_center_mappings: []
+
+  - name: enterprise-with-team
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # scope: enterprise forbids teams.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+          teams: [platform-engineering]
+          amount: 5000
+      team_cost_center_mappings: []
+
+  - name: enterprise-and-organization
+    valid: false
+    expect_error: "should not be valid under"
+    config:
+      # enterprise and organization are mutually exclusive on one entry.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering]
+          credit_scope: metered_only
+          enterprise: your-enterprise
+          organization: your-org
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: organization-on-enterprise-scope
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # organization is valid where a team is involved (scope: team or a mapping)
+      # or as the org itself (scope: organization); forbidden on scope: enterprise.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+          organization: your-org
+          amount: 5000
+      team_cost_center_mappings: []
+
+  - name: remove-extra-on-enterprise-scope
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # remove_extra_members survives only on team + metered_only.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+          amount: 5000
+          remove_extra_members: true
+      team_cost_center_mappings: []
+
+  - name: remove-extra-on-team-pool-then-metered
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # team + pool_then_metered forbids remove_extra_members (per-member user
+      # budgets have no cost center to reconcile).
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering]
+          credit_scope: pool_then_metered
+          amount: 100
+          remove_extra_members: true
+      team_cost_center_mappings: []
+
+  - name: cost-center-on-team-pool-then-metered
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # team + pool_then_metered forbids cost_center.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering]
+          credit_scope: pool_then_metered
+          cost_center: cc-org-your-org-platform-engineering
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: mapping-enterprise-and-organization
+    valid: false
+    expect_error: "should not be valid under"
+    config:
+      # enterprise/organization mutual exclusivity also applies to mappings.
+      version: 2
+      team_cost_center_mappings:
+        - team: platform-engineering
+          cost_center: cc-org-your-org-platform-engineering
+          enterprise: your-enterprise
+          organization: your-org
+
+  - name: org-scope-missing-organization
+    valid: false
+    expect_error: "'organization' is a required property"
+    config:
+      # scope: organization requires the organization field.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: organization
+          credit_scope: metered_only
+          amount: 500
+      team_cost_center_mappings: []
+
+  - name: org-scope-missing-credit-scope
+    valid: false
+    expect_error: "'credit_scope' is a required property"
+    config:
+      # scope: organization is dual-track, so credit_scope is required (like team).
+      version: 2
+      ai_credit_spend_policies:
+        - scope: organization
+          organization: your-org
+          amount: 500
+      team_cost_center_mappings: []
+
+  - name: org-scope-with-cost-center
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # scope: organization never uses a cost center (org metered_only is a direct
+      # org-scope budget).
+      version: 2
+      ai_credit_spend_policies:
+        - scope: organization
+          organization: your-org
+          credit_scope: metered_only
+          cost_center: cc-x
+          amount: 500
+      team_cost_center_mappings: []
+
+  - name: org-scope-with-team
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # scope: organization forbids teams.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: organization
+          organization: your-org
+          teams: [platform-engineering]
+          credit_scope: metered_only
+          amount: 500
+      team_cost_center_mappings: []
+
+  - name: org-scope-pool-then-metered-stop-false
+    valid: false
+    expect_error: "was expected"
+    config:
+      # scope: organization + pool_then_metered -> per-member user budgets, always hard-stop.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: organization
+          organization: your-org
+          credit_scope: pool_then_metered
+          amount: 80
+          stop_at_limit: false
+      team_cost_center_mappings: []
+
+  - name: org-scope-with-remove-extra
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # remove_extra_members survives only on team + metered_only.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: organization
+          organization: your-org
+          credit_scope: metered_only
+          amount: 500
+          remove_extra_members: true
+      team_cost_center_mappings: []
+
+  - name: user-missing-user
+    valid: false
+    expect_error: "'users' is a required property"
+    config:
+      # scope: user requires the users list (the logins to budget).
+      version: 2
+      ai_credit_spend_policies:
+        - scope: user
+          amount: 50
+      team_cost_center_mappings: []
+
+  - name: user-stop-at-limit-false
+    valid: false
+    expect_error: "was expected"
+    config:
+      # scope: user is user-level, so it forces stop_at_limit: true.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: user
+          users: [octocat]
+          amount: 50
+          stop_at_limit: false
+      team_cost_center_mappings: []
+
+  - name: user-with-team
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # scope: user forbids group/identity fields like teams.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: user
+          users: [octocat]
+          teams: [platform-engineering]
+          amount: 50
+      team_cost_center_mappings: []
+
+  - name: user-empty-users
+    valid: false
+    expect_error: "should be non-empty"
+    config:
+      # scope: user requires at least one login (users minItems: 1).
+      version: 2
+      ai_credit_spend_policies:
+        - scope: user
+          users: []
+          amount: 50
+      team_cost_center_mappings: []
+
+  - name: user-duplicate-users
+    valid: false
+    expect_error: "has non-unique elements"
+    config:
+      # users must be unique.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: user
+          users: [octocat, octocat]
+          amount: 50
+      team_cost_center_mappings: []
+
+  - name: user-singular-user-field
+    valid: false
+    expect_error: "'users' is a required property"
+    config:
+      # the singular user field was replaced by the users list; it is now unknown,
+      # and users is required.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: user
+          user: octocat
+          amount: 50
+      team_cost_center_mappings: []
+
+  - name: team-singular-team-field
+    valid: false
+    expect_error: "'teams' is a required property"
+    config:
+      # the singular team field was replaced by the teams list; it is now unknown,
+      # and teams is required.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          team: platform-engineering
+          credit_scope: pool_then_metered
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: team-empty-teams
+    valid: false
+    expect_error: "should be non-empty"
+    config:
+      # scope: team requires at least one team (teams minItems: 1).
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: []
+          credit_scope: pool_then_metered
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: team-duplicate-teams
+    valid: false
+    expect_error: "has non-unique elements"
+    config:
+      # teams must be unique.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [platform-engineering, platform-engineering]
+          credit_scope: pool_then_metered
+          amount: 100
+      team_cost_center_mappings: []
+
+  - name: multi-team-metered-with-cost-center
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # metered_only with multiple teams fans out per team, so an explicit
+      # cost_center is ambiguous and forbidden.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: team
+          teams: [data-science, ai-leads]
+          credit_scope: metered_only
+          cost_center: cc-shared
+          amount: 300
+      team_cost_center_mappings: []
+
+  - name: user-field-on-enterprise-scope
+    valid: false
+    expect_error: "False schema does not allow"
+    config:
+      # the users field belongs only to scope: user; other scopes forbid it.
+      version: 2
+      ai_credit_spend_policies:
+        - scope: enterprise
+          users: [octocat]
+          amount: 5000
+      team_cost_center_mappings: []

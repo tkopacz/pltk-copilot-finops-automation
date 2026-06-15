@@ -1,0 +1,254 @@
+# Schema test cases for schemas/v1/budget-policies.schema.json.
+#
+# One case file per (version, schema): the version is the parent directory
+# (v1), the schema is the file name (budget-policies). The runner discovers
+# tests/cases/v*/ and validates each case's `config` against the matching
+# schemas/<version>/<schema>.schema.json.
+#
+# Each case:
+#   name         short identifier shown in test output
+#   valid        true  -> config MUST pass the schema
+#                false -> config MUST be rejected by the schema
+#   expect_error (invalid cases only) substring that must appear in the
+#                validator output, so a case cannot fail for the wrong reason
+#   config       the config document to validate
+#
+# Add a case by appending to this list. See AGENTS.md "Schema Tests".
+
+cases:
+  # ── valid ──────────────────────────────────────────────────────────────────
+  - name: enterprise-minimal
+    valid: true
+    config:
+      # Only the required fields: type + budget.amount.
+      budget_policies:
+        - type: enterprise
+          budget:
+            amount: 500
+
+  - name: universal
+    valid: true
+    config:
+      enterprise_slug: your-enterprise
+      budget_policies:
+        - name: budget-universal-default
+          type: universal
+          description: Default per-user AI-credit budget for all licensed users.
+          budget:
+            amount: 50
+            prevent_further_usage: true
+
+  - name: cost-center-alert-only
+    valid: true
+    config:
+      budget_policies:
+        - name: budget-cc-platform
+          type: cost_center
+          target:
+            cost_center: cc-org-your-org-platform-engineering
+          budget:
+            amount: 200
+            # cost_center budgets may alert-only, so the schema allows prevent: false.
+            prevent_further_usage: false
+
+  - name: team-total-spend
+    valid: true
+    config:
+      budget_policies:
+        - name: budget-team-org-platform-engineering
+          type: team
+          coverage: total_spend
+          source:
+            org: your-org
+            team_slug: platform-engineering
+          budget:
+            amount: 100
+            prevent_further_usage: true
+
+  - name: team-additional-spend-auto-cc
+    valid: true
+    config:
+      # team + additional_spend with no target.cost_center (auto-created at apply time).
+      budget_policies:
+        - name: budget-team-ent-data-science
+          type: team
+          coverage: additional_spend
+          source:
+            enterprise: your-enterprise
+            team_slug: data-science
+          budget:
+            amount: 300
+
+  - name: alerting
+    valid: true
+    config:
+      budget_policies:
+        - name: budget-ent-total
+          type: enterprise
+          budget:
+            amount: 5000
+            alerting:
+              will_alert: true
+              alert_recipients:
+                - billing-admin
+                - finops-lead
+
+  - name: explicit-sku-and-type
+    valid: true
+    config:
+      # product_sku + budget.type are optional and rarely needed (scripts default
+      # and derive them), but the schema permits them.
+      budget_policies:
+        - type: enterprise
+          budget:
+            amount: 100
+            product_sku: ai_credits
+            type: BundlePricing
+
+  - name: api-overrides
+    valid: true
+    config:
+      # The optional api: block must be allowed even though example configs do
+      # not showcase it. Scripts read these keys.
+      enterprise_slug: your-enterprise
+      api:
+        budgets_endpoint_template: /enterprises/{enterprise}/settings/billing/budgets
+        cost_centers_list_endpoint_template: /enterprises/{enterprise}/settings/billing/cost-centers
+        cost_center_endpoint_template: /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}
+        cost_center_resource_endpoint_template: /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}/resource
+      budget_policies:
+        - type: enterprise
+          budget:
+            amount: 1000
+
+  - name: empty
+    valid: true
+    config:
+      # Safe no-op config.
+      enterprise_slug: your-enterprise
+      budget_policies: []
+
+  - name: version-1
+    valid: true
+    config:
+      # Explicit version marker (defaults to 1 when omitted).
+      version: 1
+      enterprise_slug: your-enterprise
+      budget_policies: []
+
+  - name: schema-allows-semantic-only-rule
+    valid: true
+    config:
+      # The schema is shape-only: it intentionally ACCEPTS this even though
+      # scripts/validate-config.sh rejects prevent_further_usage: false on a
+      # universal policy (a semantic cross-field rule that needs context the
+      # schema cannot express). This case guards that boundary so the schema is
+      # not accidentally tightened to duplicate the semantic layer.
+      budget_policies:
+        - type: universal
+          budget:
+            amount: 0
+            prevent_further_usage: false
+
+  # ── invalid ─────────────────────────────────────────────────────────────────
+  - name: typo-budget-field
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      # Misspelled budget field — additionalProperties:false catches the typo.
+      budget_policies:
+        - type: universal
+          budget:
+            amount: 10
+            prevent_furthur_usage: true
+
+  - name: bad-type-enum
+    valid: false
+    expect_error: "is not one of"
+    config:
+      budget_policies:
+        - type: enterprize
+          budget:
+            amount: 5
+
+  - name: negative-amount
+    valid: false
+    expect_error: "less than the minimum"
+    config:
+      budget_policies:
+        - type: enterprise
+          budget:
+            amount: -3
+
+  - name: amount-not-integer
+    valid: false
+    expect_error: "is not of type"
+    config:
+      # Quoted value is a string; budget.amount must be an integer.
+      budget_policies:
+        - type: enterprise
+          budget:
+            amount: "100"
+
+  - name: missing-amount
+    valid: false
+    expect_error: "'amount' is a required property"
+    config:
+      budget_policies:
+        - type: enterprise
+          budget:
+            prevent_further_usage: true
+
+  - name: missing-budget
+    valid: false
+    expect_error: "'budget' is a required property"
+    config:
+      budget_policies:
+        - name: no-budget
+          type: enterprise
+
+  - name: missing-policies-key
+    valid: false
+    expect_error: "'budget_policies' is a required property"
+    config:
+      enterprise_slug: your-enterprise
+
+  - name: bad-coverage-enum
+    valid: false
+    expect_error: "is not one of"
+    config:
+      budget_policies:
+        - type: team
+          coverage: everything
+          source:
+            org: your-org
+            team_slug: platform-engineering
+          budget:
+            amount: 100
+
+  - name: bad-version
+    valid: false
+    expect_error: "was expected"
+    config:
+      # version must be 1 (const). No schemas/v2/ exists for this contract.
+      version: 2
+      budget_policies: []
+
+  - name: unknown-top-level-key
+    valid: false
+    expect_error: "Additional properties are not allowed"
+    config:
+      enterprise_slug: your-enterprise
+      budget_policies: []
+      extra_unknown_key: true
+
+  - name: bad-budget-type-enum
+    valid: false
+    expect_error: "is not one of"
+    config:
+      # budget.type only allows BundlePricing or ProductPricing.
+      budget_policies:
+        - type: enterprise
+          budget:
+            amount: 100
+            type: WeirdPricing

@@ -4,3 +4,4 @@ reports/
 .env
 config/*.local.yml
 config/*.private.yml
+.DS_Store

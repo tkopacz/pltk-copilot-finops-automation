@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ENTERPRISE_SLUG=""
-TEAMS_CONFIG_FILE="config/cost-center-members.example.yml"
-BUDGETS_CONFIG_FILE="config/budget-policies.example.yml"
+TEAMS_CONFIG_FILE="config/copilot-finops.example.yml"
+BUDGETS_CONFIG_FILE="config/copilot-finops.example.yml"
 REPORT_DIR="reports"
 
 while [[ $# -gt 0 ]]; do
@@ -36,8 +36,27 @@ if ! command -v gh >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! comma
   exit 1
 fi
 
-scripts/validate-config.sh "$TEAMS_CONFIG_FILE" teams >/dev/null
-scripts/validate-config.sh "$BUDGETS_CONFIG_FILE" budgets >/dev/null
+# v2 merges budgets + mappings into one file (validated with 'all'); v1 keeps the
+# split files. Detect each file's version, then validate with the right type
+# (dedupe when the same merged file is passed for both roles).
+TEAMS_VERSION="$(yq eval '.version // 1' "$TEAMS_CONFIG_FILE")"
+BUDGETS_VERSION="$(yq eval '.version // 1' "$BUDGETS_CONFIG_FILE")"
+
+# v2 renamed the budgets list key to ai_credit_spend_policies; v1 keeps budget_policies.
+if [[ "$BUDGETS_VERSION" == "2" ]]; then ABLIST="ai_credit_spend_policies"; else ABLIST="budget_policies"; fi
+
+if [[ "$TEAMS_VERSION" == "2" ]]; then
+  scripts/validate-config.sh "$TEAMS_CONFIG_FILE" all >/dev/null
+else
+  scripts/validate-config.sh "$TEAMS_CONFIG_FILE" teams >/dev/null
+fi
+if [[ "$BUDGETS_CONFIG_FILE" != "$TEAMS_CONFIG_FILE" ]]; then
+  if [[ "$BUDGETS_VERSION" == "2" ]]; then
+    scripts/validate-config.sh "$BUDGETS_CONFIG_FILE" all >/dev/null
+  else
+    scripts/validate-config.sh "$BUDGETS_CONFIG_FILE" budgets >/dev/null
+  fi
+fi
 
 if [[ -z "$ENTERPRISE_SLUG" ]]; then
   ENTERPRISE_SLUG="$(yq eval '.enterprise_slug // ""' "$TEAMS_CONFIG_FILE")"
@@ -46,7 +65,21 @@ if [[ -z "$ENTERPRISE_SLUG" ]]; then
   ENTERPRISE_SLUG="$(yq eval '.enterprise_slug // ""' "$BUDGETS_CONFIG_FILE")"
 fi
 if [[ -z "$ENTERPRISE_SLUG" ]]; then
-  echo "ERROR: enterprise slug is required via --enterprise-slug or config.enterprise_slug" >&2
+  if [[ "$BUDGETS_VERSION" == "2" ]]; then
+    ENTERPRISE_SLUG="$(yq eval '[(.ai_credit_spend_policies // [])[].enterprise] | map(select(. != null and . != "")) | .[0] // ""' "$BUDGETS_CONFIG_FILE")"
+  else
+    ENTERPRISE_SLUG="$(yq eval '[(.budget_policies // [])[].source.enterprise] | map(select(. != null and . != "")) | .[0] // ""' "$BUDGETS_CONFIG_FILE")"
+  fi
+fi
+if [[ -z "$ENTERPRISE_SLUG" ]]; then
+  if [[ "$TEAMS_VERSION" == "2" ]]; then
+    ENTERPRISE_SLUG="$(yq eval '[(.team_cost_center_mappings // [])[].enterprise] | map(select(. != null and . != "")) | .[0] // ""' "$TEAMS_CONFIG_FILE")"
+  else
+    ENTERPRISE_SLUG="$(yq eval '[(.mappings // [])[].source.enterprise] | map(select(. != null and . != "")) | .[0] // ""' "$TEAMS_CONFIG_FILE")"
+  fi
+fi
+if [[ -z "$ENTERPRISE_SLUG" ]]; then
+  echo "ERROR: enterprise slug is required via --enterprise-slug, config.enterprise_slug, or a per-entry enterprise:" >&2
   exit 1
 fi
 
@@ -102,6 +135,17 @@ default_team_cost_center_name() {
   fi
 }
 
+count_org_members() {
+  local org="$1" count
+  if count="$(gh api --paginate "/orgs/$org/members?per_page=100" 2>/dev/null \
+      | jq -r 'if type == "array" then .[] else empty end | .login // empty' \
+      | sort -u | wc -l | tr -d ' ')"; then
+    printf '%s' "$count"
+  else
+    printf '%s' "unknown"
+  fi
+}
+
 {
   echo "# Copilot FinOps Audit"
   echo
@@ -111,16 +155,35 @@ default_team_cost_center_name() {
 
   echo "## Team to Cost Center mappings"
   cc_list_endpoint="/enterprises/$ENTERPRISE_SLUG/settings/billing/cost-centers"
-  map_count="$(yq eval '.mappings | length' "$TEAMS_CONFIG_FILE")"
+  if [[ "$TEAMS_VERSION" == "2" ]]; then
+    map_count="$(yq eval '(.team_cost_center_mappings // []) | length' "$TEAMS_CONFIG_FILE")"
+  else
+    map_count="$(yq eval '.mappings | length' "$TEAMS_CONFIG_FILE")"
+  fi
   if [[ "$map_count" -eq 0 ]]; then
     echo "No mappings found."
   else
     for ((i = 0; i < map_count; i++)); do
-      name="$(yq eval ".mappings[$i].name // \"mapping-$i\"" "$TEAMS_CONFIG_FILE")"
-      source_org="$(yq eval ".mappings[$i].source.org // \"\"" "$TEAMS_CONFIG_FILE")"
-      source_enterprise="$(yq eval ".mappings[$i].source.enterprise // \"\"" "$TEAMS_CONFIG_FILE")"
-      team_slug="$(yq eval ".mappings[$i].source.team_slug" "$TEAMS_CONFIG_FILE")"
-      cost_center="$(yq eval ".mappings[$i].target.cost_center" "$TEAMS_CONFIG_FILE")"
+      if [[ "$TEAMS_VERSION" == "2" ]]; then
+        name="$(yq eval ".team_cost_center_mappings[$i].name // \"mapping-$i\"" "$TEAMS_CONFIG_FILE")"
+        m_org="$(yq eval ".team_cost_center_mappings[$i].organization // \"\"" "$TEAMS_CONFIG_FILE")"
+        m_ent="$(yq eval ".team_cost_center_mappings[$i].enterprise // \"\"" "$TEAMS_CONFIG_FILE")"
+        team_slug="$(yq eval ".team_cost_center_mappings[$i].team // \"\"" "$TEAMS_CONFIG_FILE")"
+        cost_center="$(yq eval ".team_cost_center_mappings[$i].cost_center // \"\"" "$TEAMS_CONFIG_FILE")"
+        if has_value "$m_org"; then
+          source_org="$m_org"
+          source_enterprise=""
+        else
+          source_org=""
+          if has_value "$m_ent"; then source_enterprise="$m_ent"; else source_enterprise="$ENTERPRISE_SLUG"; fi
+        fi
+      else
+        name="$(yq eval ".mappings[$i].name // \"mapping-$i\"" "$TEAMS_CONFIG_FILE")"
+        source_org="$(yq eval ".mappings[$i].source.org // \"\"" "$TEAMS_CONFIG_FILE")"
+        source_enterprise="$(yq eval ".mappings[$i].source.enterprise // \"\"" "$TEAMS_CONFIG_FILE")"
+        team_slug="$(yq eval ".mappings[$i].source.team_slug" "$TEAMS_CONFIG_FILE")"
+        cost_center="$(yq eval ".mappings[$i].target.cost_center" "$TEAMS_CONFIG_FILE")"
+      fi
 
       source_label="$(team_source_label "$source_org" "$source_enterprise" "$team_slug")"
 
@@ -149,23 +212,56 @@ default_team_cost_center_name() {
 
   echo
   echo "## Budget policies"
-  policy_count="$(yq eval '.budget_policies | length' "$BUDGETS_CONFIG_FILE")"
+  if [[ "$BUDGETS_VERSION" == "2" ]]; then plabel="scope"; else plabel="type"; fi
+  policy_count="$(yq eval "(.${ABLIST} // []) | length" "$BUDGETS_CONFIG_FILE")"
   if [[ "$policy_count" -eq 0 ]]; then
     echo "No budget policies found."
   else
     for ((i = 0; i < policy_count; i++)); do
-      name="$(yq eval ".budget_policies[$i].name // \"policy-$i\"" "$BUDGETS_CONFIG_FILE")"
-      policy_type="$(yq eval ".budget_policies[$i].type // \"\"" "$BUDGETS_CONFIG_FILE")"
-      sku="$(yq eval ".budget_policies[$i].budget.product_sku // \"ai_credits\"" "$BUDGETS_CONFIG_FILE")"
-      amount="$(yq eval ".budget_policies[$i].budget.amount // 0" "$BUDGETS_CONFIG_FILE")"
-      # Read raw (not via //, which coalesces false to the default) then default
-      # an omitted value to true.
-      prevent="$(yq eval ".budget_policies[$i].budget.prevent_further_usage" "$BUDGETS_CONFIG_FILE")"
-      if [[ -z "$prevent" || "$prevent" == "null" ]]; then prevent="true"; fi
-      coverage="$(yq eval ".budget_policies[$i].coverage // \"total_spend\"" "$BUDGETS_CONFIG_FILE")"
+      if [[ "$BUDGETS_VERSION" == "2" ]]; then
+        name="$(yq eval ".${ABLIST}[$i].name // \"policy-$i\"" "$BUDGETS_CONFIG_FILE")"
+        policy_type="$(yq eval ".${ABLIST}[$i].scope // \"\"" "$BUDGETS_CONFIG_FILE")"
+        sku="ai_credits"
+        amount="$(yq eval ".${ABLIST}[$i].amount // 0" "$BUDGETS_CONFIG_FILE")"
+        prevent="$(yq eval ".${ABLIST}[$i].stop_at_limit" "$BUDGETS_CONFIG_FILE")"
+        if [[ -z "$prevent" || "$prevent" == "null" ]]; then prevent="true"; fi
+        # v2 surface field is credit_scope; map to internal coverage vocab.
+        case "$(yq eval ".${ABLIST}[$i].credit_scope // \"\"" "$BUDGETS_CONFIG_FILE")" in
+          pool_then_metered) coverage="total_spend" ;;
+          metered_only) coverage="additional_spend" ;;
+          *) coverage="total_spend" ;;
+        esac
+        b_org="$(yq eval ".${ABLIST}[$i].organization // \"\"" "$BUDGETS_CONFIG_FILE")"
+        b_ent="$(yq eval ".${ABLIST}[$i].enterprise // \"\"" "$BUDGETS_CONFIG_FILE")"
+        mapfile -t teams_list < <(yq eval ".${ABLIST}[$i].teams[]?" "$BUDGETS_CONFIG_FILE")
+        mapfile -t users_list < <(yq eval ".${ABLIST}[$i].users[]?" "$BUDGETS_CONFIG_FILE")
+        policy_cost_center="$(yq eval ".${ABLIST}[$i].cost_center // \"\"" "$BUDGETS_CONFIG_FILE")"
+        if has_value "$b_org"; then
+          source_org="$b_org"
+          source_enterprise=""
+        else
+          source_org=""
+          if has_value "$b_ent"; then source_enterprise="$b_ent"; else source_enterprise="$ENTERPRISE_SLUG"; fi
+        fi
+      else
+        name="$(yq eval ".budget_policies[$i].name // \"policy-$i\"" "$BUDGETS_CONFIG_FILE")"
+        policy_type="$(yq eval ".budget_policies[$i].type // \"\"" "$BUDGETS_CONFIG_FILE")"
+        sku="$(yq eval ".budget_policies[$i].budget.product_sku // \"ai_credits\"" "$BUDGETS_CONFIG_FILE")"
+        amount="$(yq eval ".budget_policies[$i].budget.amount // 0" "$BUDGETS_CONFIG_FILE")"
+        prevent="$(yq eval ".budget_policies[$i].budget.prevent_further_usage" "$BUDGETS_CONFIG_FILE")"
+        if [[ -z "$prevent" || "$prevent" == "null" ]]; then prevent="true"; fi
+        coverage="$(yq eval ".budget_policies[$i].coverage // \"total_spend\"" "$BUDGETS_CONFIG_FILE")"
+        source_org="$(yq eval ".budget_policies[$i].source.org // \"\"" "$BUDGETS_CONFIG_FILE")"
+        source_enterprise="$(yq eval ".budget_policies[$i].source.enterprise // \"\"" "$BUDGETS_CONFIG_FILE")"
+        team_slug="$(yq eval ".budget_policies[$i].source.team_slug // \"\"" "$BUDGETS_CONFIG_FILE")"
+        policy_cost_center="$(yq eval ".budget_policies[$i].target.cost_center // \"\"" "$BUDGETS_CONFIG_FILE")"
+        users_list=()
+        teams_list=()
+        has_value "$team_slug" && teams_list=("$team_slug")
+      fi
       case "$policy_type" in
         enterprise) scope="enterprise" ;;
-        universal) scope="multi_user_customer" ;;
+        all_users | universal) scope="multi_user_customer" ;;
         cost_center) scope="cost_center" ;;
         team)
           if [[ "$coverage" == "additional_spend" ]]; then
@@ -174,33 +270,56 @@ default_team_cost_center_name() {
             scope="user"
           fi
           ;;
+        organization)
+          if [[ "$coverage" == "additional_spend" ]]; then
+            scope="organization"
+          else
+            scope="user"
+          fi
+          ;;
+        user) scope="user" ;;
         *) scope="?" ;;
       esac
-      echo "- **$name** [type=$policy_type -> budget_scope=$scope]"
+      echo "- **$name** [$plabel=$policy_type -> budget_scope=$scope]"
       echo "  - Budget: sku=\`$sku\`, amount=\`$amount\` USD, prevent_further_usage=\`$prevent\`"
 
       if [[ "$policy_type" == "cost_center" ]]; then
-        cost_center="$(yq eval ".budget_policies[$i].target.cost_center // \"\"" "$BUDGETS_CONFIG_FILE")"
-        echo "  - Target cost center: $cost_center"
+        echo "  - Target cost center: $policy_cost_center"
       fi
 
       if [[ "$policy_type" == "team" ]]; then
-        source_org="$(yq eval ".budget_policies[$i].source.org // \"\"" "$BUDGETS_CONFIG_FILE")"
-        source_enterprise="$(yq eval ".budget_policies[$i].source.enterprise // \"\"" "$BUDGETS_CONFIG_FILE")"
-        team_slug="$(yq eval ".budget_policies[$i].source.team_slug // \"\"" "$BUDGETS_CONFIG_FILE")"
-        member_count="$(count_team_members "$source_org" "$source_enterprise" "$team_slug")"
-        echo "  - Source: $(team_source_label "$source_org" "$source_enterprise" "$team_slug")"
         if [[ "$coverage" == "additional_spend" ]]; then
-          cost_center="$(yq eval ".budget_policies[$i].target.cost_center // \"\"" "$BUDGETS_CONFIG_FILE")"
-          if ! has_value "$cost_center"; then
-            cost_center="$(default_team_cost_center_name "$source_org" "$source_enterprise" "$team_slug")"
-          fi
-          echo "  - Coverage: additional_spend (one cost center budget)"
-          echo "  - Target cost center: $cost_center"
-          echo "  - Team member count (cost center should contain these users): $member_count"
+          echo "  - Coverage: additional_spend (one cost center budget per team)"
+          for team_slug in "${teams_list[@]}"; do
+            member_count="$(count_team_members "$source_org" "$source_enterprise" "$team_slug")"
+            cost_center="$policy_cost_center"
+            if [[ ${#teams_list[@]} -gt 1 ]] || ! has_value "$cost_center"; then
+              cost_center="$(default_team_cost_center_name "$source_org" "$source_enterprise" "$team_slug")"
+            fi
+            echo "  - $(team_source_label "$source_org" "$source_enterprise" "$team_slug") -> cost center $cost_center (members: $member_count)"
+          done
         else
           echo "  - Coverage: total_spend (one user budget per member)"
-          echo "  - Team member count (individual budgets would be applied): $member_count"
+          for team_slug in "${teams_list[@]}"; do
+            member_count="$(count_team_members "$source_org" "$source_enterprise" "$team_slug")"
+            echo "  - $(team_source_label "$source_org" "$source_enterprise" "$team_slug") (members: $member_count)"
+          done
+        fi
+      fi
+
+      if [[ "$policy_type" == "user" ]]; then
+        echo "  - Users (one hard-stop user budget each): ${users_list[*]}"
+        echo "  - User budget count: ${#users_list[@]}"
+      fi
+
+      if [[ "$policy_type" == "organization" ]]; then
+        echo "  - Organization: \`$b_org\` (written on the org billing endpoint)"
+        if [[ "$coverage" == "additional_spend" ]]; then
+          echo "  - Coverage: additional_spend (one organization-scope budget)"
+        else
+          member_count="$(count_org_members "$b_org")"
+          echo "  - Coverage: total_spend (one user budget per org member)"
+          echo "  - Organization member count (individual budgets would be applied): $member_count"
         fi
       fi
     done
@@ -210,6 +329,7 @@ default_team_cost_center_name() {
   echo "## Actionable notes"
   echo "- Keep mutating workflows in dry-run mode by default."
   echo "- Budgets are created via \`POST /enterprises/{enterprise}/settings/billing/budgets\` (GA enhanced billing)."
+  echo "- Organization-scope budgets (scope: organization) are written on \`POST /organizations/{organization}/settings/billing/budgets\`."
   echo "- Cost center members are managed via \`POST|DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}/resource\`."
   echo "- Enterprise team mappings use the bare team slug in config (for example, \`my-team-name\`)."
 } >"$report_file"

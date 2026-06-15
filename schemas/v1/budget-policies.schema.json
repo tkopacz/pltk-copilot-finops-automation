@@ -1,0 +1,138 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/copilot-finops-automation/schemas/v1/budget-policies.schema.json",
+  "title": "Copilot FinOps budget policies (v1)",
+  "description": "Schema for config/budget-policies*.yml. Validates structure, types, and enums only. Cross-field semantic rules (e.g. universal/team hard-stop, cost_center requires target.cost_center, team requires a source, name->ID resolution, and anything needing live GitHub data) are enforced by scripts/validate-config.sh and the apply script, not here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["budget_policies"],
+  "properties": {
+    "version": {
+      "description": "Config contract version. Optional; defaults to 1 when omitted. Each version has a frozen schema under schemas/v<N>/, so v1 configs keep validating against this file even after the contract evolves.",
+      "const": 1
+    },
+    "enterprise_slug": {
+      "description": "GitHub Enterprise slug. Optional here; may instead be passed via --enterprise-slug or the workflow input.",
+      "type": "string",
+      "minLength": 1
+    },
+    "api": {
+      "description": "Advanced REST endpoint overrides. Leave unset for github.com; only set when proxying the GitHub API. Not shown in example configs by convention.",
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "properties": {
+        "budgets_endpoint_template": { "type": "string" },
+        "cost_centers_list_endpoint_template": { "type": "string" },
+        "cost_center_endpoint_template": { "type": "string" },
+        "cost_center_resource_endpoint_template": { "type": "string" }
+      }
+    },
+    "budget_policies": {
+      "description": "List of budget policies to reconcile. May be empty for a safe no-op config.",
+      "type": "array",
+      "items": { "$ref": "#/definitions/budgetPolicy" }
+    }
+  },
+  "definitions": {
+    "budgetPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "budget"],
+      "properties": {
+        "name": {
+          "description": "Local label used in logs and the --policy-name filter. Never sent to the API.",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "description": "Budget policy type. enterprise -> enterprise scope; universal -> every licensed user (multi_user_customer); cost_center -> one cost center; team -> materialized from a team's membership (see coverage).",
+          "enum": ["enterprise", "universal", "cost_center", "team"]
+        },
+        "description": {
+          "description": "Optional human-readable description.",
+          "type": "string"
+        },
+        "coverage": {
+          "description": "Only meaningful for type: team. total_spend (default) caps shared pool + additional via one user budget per member (always hard-stop). additional_spend caps collective metered spend via a single cost center budget.",
+          "enum": ["total_spend", "additional_spend"]
+        },
+        "source": {
+          "description": "Team source. Required for type: team (enforced by validate-config.sh). Provide team_slug plus exactly one of org or enterprise.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "org": {
+              "description": "Organization login for an org team source.",
+              "type": "string",
+              "minLength": 1
+            },
+            "enterprise": {
+              "description": "Enterprise slug for an enterprise team source.",
+              "type": "string",
+              "minLength": 1
+            },
+            "team_slug": {
+              "description": "Bare team slug (no ent: prefix).",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "target": {
+          "description": "Budget target. Required for type: cost_center. Optional for type: team coverage: additional_spend (auto-derived/created when omitted).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cost_center": {
+              "description": "Cost center name (resolved to its ID at apply time and sent as budget_entity_name).",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "budget": { "$ref": "#/definitions/budget" }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount"],
+      "properties": {
+        "amount": {
+          "description": "Budget cap in whole USD. Maps to budget_amount.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "prevent_further_usage": {
+          "description": "Hard-stop usage at the cap. Optional; defaults to true. Must stay true for universal and team coverage: total_spend (enforced by validate-config.sh).",
+          "type": "boolean"
+        },
+        "product_sku": {
+          "description": "Billing product SKU. Optional; defaults to ai_credits (the Copilot metered SKU). budget_type is derived from this (ai_credits -> BundlePricing, otherwise ProductPricing). Omit for normal Copilot AI-credit budgets.",
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "description": "Explicit budget_type override. Optional and rarely needed; normally derived from product_sku. Valid values: BundlePricing, ProductPricing.",
+          "enum": ["BundlePricing", "ProductPricing"]
+        },
+        "alerting": {
+          "description": "Optional spend alerting.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "will_alert": {
+              "description": "Emit budget alerts. Optional; defaults to false.",
+              "type": "boolean"
+            },
+            "alert_recipients": {
+              "description": "Logins to notify. Optional; defaults to an empty list.",
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

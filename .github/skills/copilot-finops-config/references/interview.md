@@ -17,26 +17,35 @@ Ask these first:
 
 ## Budget Policy Questions
 
-Ask when generating `budget_policies`.
+Ask when generating `ai_credit_spend_policies`.
 
 General:
 
-- Do you want a universal default user budget?
-- Do you want an enterprise metered-spend cap?
+> Any non-empty budget set must include exactly one all-users default (required). An enterprise cap is optional but limited to one. If the user wants budgets at all, always generate the all-users default, plus whatever else they ask for.
+
+- An all-users default user budget is **required** when defining budgets (exactly one). Confirm its amount.
+- An enterprise metered-spend cap is **optional** (at most one). Offer it and confirm its amount if wanted.
+- Do you want to budget one or more specific users (`scope: user`)? If yes, which logins and amount?
 - Do you want one or more cost center metered-spend caps?
 - Do you want team-based budgets?
 - Do you need alerts? If yes, which GitHub logins should receive alerts?
 
-Universal budget:
+All-users budget:
 
 - Amount in whole USD.
-- Confirm `prevent_further_usage: true` because user-level budgets always hard-stop.
+- Confirm the budget hard-stops (`stop_at_limit` omitted or `true`) because user-level budgets always hard-stop.
+
+User budget (`scope: user`):
+
+- The GitHub login(s) to budget (`users:` — one or more).
+- Amount in whole USD (applied to each listed login).
+- Always hard-stops (user-level budgets cannot alert-only).
 
 Enterprise budget:
 
 - Amount in whole USD.
-- Should it hard-stop at the cap (`prevent_further_usage: true`) or alert-only (`false`)?
-- Alert recipients, if any.
+- Should it hard-stop at the cap (`stop_at_limit: true`, the default) or alert-only (`stop_at_limit: false`)?
+- Alert recipients, if any (`alert_admins`).
 
 Cost center budget:
 
@@ -47,31 +56,39 @@ Cost center budget:
 
 Team budget:
 
-- Is the source an org team or enterprise team?
-- Org name, if org team.
+- Is the source an org team or enterprise team? (org team -> set `organization:`; enterprise team -> omit it, the enterprise is inferred.)
+- Org login, if org team.
 - Enterprise slug, if enterprise team and different from top-level.
-- Bare team slug.
-- Which coverage mode?
-  - `total_spend`: per-member user budgets; caps shared pool + metered usage; always hard-stop.
-  - `additional_spend`: one cost center budget; caps collective metered usage after the shared pool; hard-stop optional.
-- For `additional_spend`, ask whether to use an existing `target.cost_center` or let the script derive/create one.
+- Bare team slug(s) (`teams:` — one or more; the policy is applied to each).
+- Which credit scope?
+  - `pool_then_metered`: per-member user budgets (members unioned + deduped across the listed teams); covers shared pool + metered usage; always hard-stop.
+  - `metered_only`: one cost center budget per listed team; covers collective metered usage after the shared pool; hard-stop optional.
+- For `metered_only`, ask whether to use an existing `cost_center:` (single team only) or let the script derive/create one per team, and whether to prune members who left the team (`remove_extra_members`).
 - Amount in whole USD.
+
+Organization budget:
+
+- Which organization login (`organization:`)?
+- Which credit scope?
+  - `pool_then_metered`: one user budget per org member; always hard-stop.
+  - `metered_only`: one org-scope budget for the org's collective metered usage; hard-stop optional.
+- Amount in whole USD.
+- Note: if org members also receive a team total-spend budget, the last policy in the file wins for any shared login (flagged in the summary).
 
 ## Cost Center Member Sync Questions
 
-Ask when generating `mappings`.
+Ask when generating `team_cost_center_mappings`.
 
 For each mapping:
 
-- Source type: org team or enterprise team.
-- Org name, if org team.
+- Source type: org team (set `organization:`) or enterprise team (omit it).
+- Org login, if org team.
 - Enterprise slug, if enterprise team and different from top-level.
 - Bare team slug.
-- Target cost center display name.
-- Should sync remove extra users not in the team?
+- Destination cost center name (`cost_center:`).
+- Should sync remove extra users not in the team (`remove_extra_members`)?
   - `true`: strict reconciliation.
   - `false` or omitted: additive only, preserves manual members.
-- Batch size if user cares; otherwise omit or use 50.
 
 ## Safety Questions
 

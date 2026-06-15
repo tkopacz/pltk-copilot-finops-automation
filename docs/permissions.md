@@ -34,17 +34,25 @@ Use the least privilege that supports the workflows you enable:
 | --- | ---: | --- |
 | Audit | No | Read enterprise billing/cost centers, read org or enterprise team membership. |
 | Sync cost center members | Yes | Read team membership, read cost centers, add/remove cost center resources. |
-| Apply budgets | Yes | Read/list budgets, create/update budgets, and read/create cost centers for `team` + `coverage: additional_spend`. |
+| Apply budgets | Yes | Read/list budgets, create/update budgets, and read/create cost centers for team budgets that cap metered usage only (`team` + `credit_scope: metered_only`). |
 
-If you only use `enterprise` and `universal` budget policies, the token does not need org team membership read access. If you use org or enterprise `team` policies, it does.
+If you only use `enterprise` and `all_users` budget policies, the token does not need org team membership read access. If you use org or enterprise `team` policies, it does.
 
 If you do not use org teams anywhere in config, you can omit `read:org`. If you do use org teams, keep it.
 
 ## Enterprise team tokens
 
-Enterprise teams (`source.enterprise`) use `/enterprises/{enterprise}/teams/{team_slug}/memberships`.
+Enterprise teams (v1 `source.enterprise`; v2 a `team` with no `organization:`) use `/enterprises/{enterprise}/teams/{team_slug}/memberships`.
 This endpoint requires a classic PAT with `read:enterprise` scope, or a fine-grained token with
 the "Enterprise teams" read permission.
+
+## Organization budgets (v2 `scope: organization`)
+
+A `scope: organization` budget is written on the org billing endpoint
+(`/organizations/{org}/settings/billing/budgets`) and reads org membership from
+`/orgs/{org}/members`. The authenticated user must be an organization admin or billing manager for
+that org (a fine-grained token needs organization "Administration" write for create/update). The
+per-member track also reads `read:org` membership.
 
 ## Safety recommendations
 

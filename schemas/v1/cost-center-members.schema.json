@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/copilot-finops-automation/schemas/v1/cost-center-members.schema.json",
+  "title": "Copilot FinOps cost center member sync (v1)",
+  "description": "Schema for config/cost-center-members*.yml. Validates structure, types, and enums only. Cross-field semantic rules (e.g. a mapping needs source.org or source.enterprise, batch_size clamping, and anything needing live GitHub data) are enforced by scripts/validate-config.sh and the sync script, not here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["mappings"],
+  "properties": {
+    "version": {
+      "description": "Config contract version. Optional; defaults to 1 when omitted. Each version has a frozen schema under schemas/v<N>/, so v1 configs keep validating against this file even after the contract evolves.",
+      "const": 1
+    },
+    "enterprise_slug": {
+      "description": "GitHub Enterprise slug. Optional here; may instead be passed via --enterprise-slug or the workflow input.",
+      "type": "string",
+      "minLength": 1
+    },
+    "api": {
+      "description": "Advanced REST endpoint overrides. Leave unset for github.com; only set when proxying the GitHub API. Not shown in example configs by convention.",
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "properties": {
+        "cost_centers_list_endpoint_template": { "type": "string" },
+        "cost_center_endpoint_template": { "type": "string" },
+        "cost_center_resource_endpoint_template": { "type": "string" }
+      }
+    },
+    "mappings": {
+      "description": "List of team -> cost center membership mappings. May be empty for a safe no-op config.",
+      "type": "array",
+      "items": { "$ref": "#/definitions/mapping" }
+    }
+  },
+  "definitions": {
+    "mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "target"],
+      "properties": {
+        "name": {
+          "description": "Local label used in logs and the --mapping-name filter.",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "description": "Optional human-readable description.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Team source. Provide team_slug plus exactly one of org or enterprise (the org/enterprise choice is enforced by validate-config.sh).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["team_slug"],
+          "properties": {
+            "org": {
+              "description": "Organization login for an org team source.",
+              "type": "string",
+              "minLength": 1
+            },
+            "enterprise": {
+              "description": "Enterprise slug for an enterprise team source.",
+              "type": "string",
+              "minLength": 1
+            },
+            "team_slug": {
+              "description": "Bare team slug (no ent: prefix).",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "target": {
+          "description": "Cost center to sync the team's members into.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cost_center"],
+          "properties": {
+            "cost_center": {
+              "description": "Cost center name (resolved to its ID at sync time).",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "sync": {
+          "description": "Optional sync behavior.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "remove_extra_members": {
+              "description": "Remove cost center users who are no longer in the team. Optional; defaults to false (additive sync).",
+              "type": "boolean"
+            },
+            "batch_size": {
+              "description": "Members added/removed per API call. Optional; defaults to 50. Must be 1-50.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -2,10 +2,14 @@
 # emitted by scripts/apply-user-budgets.sh (BUDGET_SUMMARY_FILE, JSON Lines).
 # Usage: jq -rs -f apply-summary.jq budget-summary.jsonl
 #
-# Each input record looks like:
+# Budget records look like:
 #   {policy, type, sku, entity_type, entity, group, action, old_amount, new_amount, dry_run}
-# entity_type is one of: enterprise | universal | cost_center | user
+# entity_type is one of: enterprise | all_users | cost_center | user | organization
 # action is one of: create | update | nochange | create-failed | update-failed
+#
+# Conflict records (emitted by the pre-flight) look like:
+#   {record:"conflict", kind, entity, winner, policies:[...], dry_run}
+# kind is one of: duplicate_user_budget | user_cost_center_overlap
 
 def money(x): if x == null then "—" else "$" + (x | tostring) end;
 
@@ -36,7 +40,7 @@ def code_or_dash(x):
 
 def target(r):
   if r.entity_type == "enterprise" then "Enterprise `" + r.entity + "`"
-  elif r.entity_type == "universal" then r.entity
+  elif r.entity_type == "all_users" then r.entity
   elif r.entity_type == "cost_center" then "Cost center `" + r.entity + "`"
   elif r.entity_type == "user" then "User `" + r.entity + "`"
   else (r.entity_type // "target") + " `" + (r.entity // "—") + "`" end;
@@ -61,8 +65,10 @@ def groups_summary:
   | unique
   | if length == 0 then "—" else map("`" + . + "`") | join(", ") end;
 
-. as $all
-| ($all[0].dry_run) as $dry
+. as $records
+| ($records[0].dry_run) as $dry
+| ($records | map(select(.record == "conflict"))) as $conflicts
+| ($records | map(select((.record // "budget") != "conflict"))) as $all
 | (
     # ---- Run overview ----
     ["### Run overview", "",
@@ -72,7 +78,25 @@ def groups_summary:
      "| Targets reconciled | " + ($all | length | tostring) + " |",
      "| Targets with changes | " + ($all | count_changed | tostring) + " |",
      "| Failed actions | " + ($all | count_failed | tostring) + " |",
+     "| Conflicts flagged | " + ($conflicts | length | tostring) + " |",
      ""]
+
+    # ---- Conflicts (prominent: GHE forbids duplicate budgets) ----
+    + ( if ($conflicts | length) > 0 then
+          ["### \u26a0\ufe0f Conflicts", "",
+           "GHE does not allow duplicate budgets for the same entity. For a **duplicate user budget**, the last policy in config order wins and the earlier ones were skipped. A **user + cost-center** overlap is informational (GHE allows both).", "",
+           "| Type | User | Policies | Winner |", "| --- | --- | --- | --- |"]
+          + ( $conflicts
+              | sort_by([(.kind // ""), (.entity // "")])
+              | map("| "
+                  + (if .kind == "duplicate_user_budget" then "Duplicate user budget"
+                     elif .kind == "user_cost_center_overlap" then "User + cost-center (info)"
+                     else (.kind // "conflict") end)
+                  + " | `" + (.entity // "—") + "` | "
+                  + ((.policies // []) | map("`" + . + "`") | join(", "))
+                  + " | " + (if (.winner // "") == "" then "—" else "`" + .winner + "`" end) + " |") )
+          + [""]
+        else [] end )
 
     # ---- Totals ----
     + ["### Actions summary", "", "| Outcome | Count |", "| --- | ---: |"]

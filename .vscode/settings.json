@@ -1,0 +1,19 @@
+{
+  "yaml.schemas": {
+    "./schemas/v1/budget-policies.schema.json": [
+      "config/budget-policies.yml",
+      "config/budget-policies.*.yml"
+    ],
+    "./schemas/v1/cost-center-members.schema.json": [
+      "config/cost-center-members.yml",
+      "config/cost-center-members.*.yml"
+    ],
+    "./schemas/v2/copilot-finops.schema.json": [
+      "config/copilot-finops.yml",
+      "config/copilot-finops.*.yml"
+    ]
+  },
+  "yaml.validate": true,
+  "yaml.completion": true,
+  "yaml.hover": true
+}

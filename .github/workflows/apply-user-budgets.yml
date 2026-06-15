@@ -7,14 +7,14 @@ on:
         description: GitHub Enterprise slug (optional; defaults to enterprise_slug in the config file)
         required: false
         type: string
-      budget_policies_config_file:
-        description: Budget policies config file path
-        required: true
-        default: config/budget-policies.yml
-        type: string
-      budget_policies_issue_number:
-        description: Optional issue number created with the Budget policy config request template
+      config_file:
+        description: Unified v2 config file path. Overrides budget_policies_config_file when set.
         required: false
+        type: string
+      budget_policies_config_file:
+        description: Config file path (defaults to the v2 merged config). A v1 split file is accepted here but deprecated.
+        required: true
+        default: config/copilot-finops.yml
         type: string
       policy_name:
         description: Optional single policy name to process
@@ -31,7 +31,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   apply:
@@ -45,17 +44,17 @@ jobs:
         uses: actions/checkout@v6
 
       - name: 🔍 Resolve config
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           scripts/resolve-budget-policies-config.sh \
-            --config-file "${{ inputs.budget_policies_config_file || 'config/budget-policies.yml' }}" \
-            --issue-number "${{ inputs.budget_policies_issue_number || '' }}" \
+            --config-file "${{ inputs.config_file || inputs.budget_policies_config_file || 'config/copilot-finops.yml' }}" \
             --dry-run "${{ inputs.dry_run }}"
+
+      - name: 📦 Install schema validator
+        run: pipx install check-jsonschema
 
       - name: ✅ Validate config
         run: |
-          scripts/validate-config.sh "$BUDGET_POLICIES_CONFIG_FILE" budgets
+          scripts/validate-config.sh "$BUDGET_POLICIES_CONFIG_FILE" "$BUDGET_POLICIES_CONFIG_TYPE"
 
       - name: 🚀 Apply budget policies
         id: apply
@@ -126,31 +125,3 @@ jobs:
             echo
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: 💬 Comment on issue
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          APPLY_OUTCOME: ${{ steps.apply.outcome }}
-        run: |
-          if [[ "${BUDGET_POLICIES_CONFIG_FROM_ISSUE:-false}" != "true" ]]; then
-            exit 0
-          fi
-
-          comment_file="$RUNNER_TEMP/budget-policy-dry-run-comment.md"
-          {
-            echo "## Budget policy dry-run result"
-            echo
-            echo "- **Outcome:** $APPLY_OUTCOME"
-            echo "- **Config SHA-256:** \`$BUDGET_POLICIES_CONFIG_SHA256\`"
-            echo "- **Issue updated at:** $BUDGET_POLICIES_ISSUE_UPDATED_AT"
-            echo "- **Workflow run:** $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo
-            if [[ -f rendered-summary.md ]]; then
-              cat rendered-summary.md
-            else
-              echo "No rendered summary was produced. Check the workflow run logs."
-            fi
-          } > "$comment_file"
-
-          gh issue comment "$BUDGET_POLICIES_ISSUE_NUMBER" --body-file "$comment_file"

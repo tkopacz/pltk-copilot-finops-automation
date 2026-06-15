@@ -2,7 +2,6 @@
 set -euo pipefail
 
 CONFIG_FILE_INPUT=""
-ISSUE_NUMBER=""
 OUTPUT_ENV_FILE="${GITHUB_ENV:-}"
 OUTPUT_SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-}"
 
@@ -10,10 +9,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --config-file)
       CONFIG_FILE_INPUT="$2"
-      shift 2
-      ;;
-    --issue-number)
-      ISSUE_NUMBER="$2"
       shift 2
       ;;
     --dry-run)
@@ -49,72 +44,41 @@ fi
 
 resolved_config_file="$CONFIG_FILE_INPUT"
 resolved_config_source="file: $CONFIG_FILE_INPUT"
-resolved_config_from_issue="false"
-issue_url=""
-issue_updated_at=""
-config_sha256=""
 
-if [[ -n "$ISSUE_NUMBER" ]]; then
-  issue_json="$RUNNER_TEMP/budget-policy-issue.json"
-  issue_body="$RUNNER_TEMP/budget-policy-issue.md"
-  resolved_config_file="$RUNNER_TEMP/budget-policies.yml"
+# This resolver is file-based only. Issue-based config testing goes through the
+# unified apply-copilot-finops.yml workflow (scripts/resolve-copilot-finops-config.sh).
 
-  gh issue view "$ISSUE_NUMBER" --json number,title,state,url,updatedAt,labels,body >"$issue_json"
-  jq -r '.body' "$issue_json" >"$issue_body"
+# Emit the validate-config type for the resolved file: v2 merged files validate
+# with 'all', v1 budget files with 'budgets'. Keeps the workflow validate step thin.
+config_version="$(yq eval '.version // 1' "$resolved_config_file" 2>/dev/null || echo 1)"
+if [[ "$config_version" == "2" ]]; then
+  resolved_config_type="all"
+else
+  resolved_config_type="budgets"
+fi
 
-  if [[ "$(jq -r '.state' "$issue_json")" != "OPEN" ]]; then
-    echo "ERROR: Issue #$ISSUE_NUMBER must be open." >&2
-    exit 1
-  fi
-
-  if ! jq -e 'any(.labels[].name; . == "budget-policy-config")' "$issue_json" >/dev/null; then
-    echo "ERROR: Issue #$ISSUE_NUMBER must have the budget-policy-config label." >&2
-    exit 1
-  fi
-
-  awk '
-    BEGIN { in_section=0; in_fence=0 }
-    /^### Budget policies YAML[[:space:]]*$/ { in_section=1; next }
-    in_section && /^### / && !in_fence { exit }
-    in_section && /^```/ {
-      if (!in_fence) { in_fence=1; next }
-      exit
-    }
-    in_section && in_fence { print }
-  ' "$issue_body" >"$resolved_config_file"
-
-  if [[ ! -s "$resolved_config_file" ]]; then
-    echo "ERROR: Could not extract a fenced YAML block from the 'Budget policies YAML' issue field." >&2
-    exit 1
-  fi
-
-  resolved_config_source="issue #$ISSUE_NUMBER: Budget policies YAML"
-  resolved_config_from_issue="true"
-  issue_url="$(jq -r '.url' "$issue_json")"
-  issue_updated_at="$(jq -r '.updatedAt' "$issue_json")"
-  config_sha256="$(shasum -a 256 "$resolved_config_file" | awk '{print $1}')"
+# Deprecation: the tracked default is now config/copilot-finops.yml (v2). v1 split files are
+# still accepted but deprecated. Surface a notice when a v1 file is resolved.
+deprecation_note=""
+if [[ "$config_version" != "2" ]]; then
+  deprecation_note="v1 split config files are deprecated; migrate to config/copilot-finops.yml (v2) with scripts/migrate-v1-to-v2.sh."
+  echo "DEPRECATION: $deprecation_note" >&2
 fi
 
 {
   echo "BUDGET_POLICIES_CONFIG_FILE=$resolved_config_file"
+  echo "BUDGET_POLICIES_CONFIG_TYPE=$resolved_config_type"
   echo "BUDGET_POLICIES_CONFIG_SOURCE=$resolved_config_source"
-  echo "BUDGET_POLICIES_CONFIG_FROM_ISSUE=$resolved_config_from_issue"
-  echo "BUDGET_POLICIES_ISSUE_NUMBER=$ISSUE_NUMBER"
-  echo "BUDGET_POLICIES_ISSUE_URL=$issue_url"
-  echo "BUDGET_POLICIES_ISSUE_UPDATED_AT=$issue_updated_at"
-  echo "BUDGET_POLICIES_CONFIG_SHA256=$config_sha256"
 } >>"$OUTPUT_ENV_FILE"
 
 {
   echo "## Budget policies config"
   echo
   echo "- **Source:** $resolved_config_source"
-  if [[ "$resolved_config_from_issue" == "true" ]]; then
-    echo "- **Issue:** $issue_url"
-    echo "- **Issue updated at:** $issue_updated_at"
-    echo "- **Config SHA-256:** \`$config_sha256\`"
-  fi
   echo "- **Resolved file:** \`$resolved_config_file\`"
+  if [[ -n "$deprecation_note" ]]; then
+    echo "- **⚠️ Deprecation:** $deprecation_note"
+  fi
   echo
   echo "<details><summary>Config YAML</summary>"
   echo

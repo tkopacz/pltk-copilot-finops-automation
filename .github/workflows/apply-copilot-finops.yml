@@ -1,0 +1,216 @@
+name: 💸 Apply Copilot FinOps
+
+# Unified v2 workflow: resolves the merged config once, then applies budgets and
+# syncs cost center members in PARALLEL. Each job writes its own detailed summary
+# (same renderers as the per-type workflows). File-based: the enterprise slug and
+# all policies come from the merged v2 config.
+#
+# This is additive: the per-type apply-user-budgets.yml and
+# sync-cost-center-members.yml workflows remain for v1 split files and for
+# issue-based config testing. This workflow requires the v2 merged config
+# (version: 2).
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_file:
+        description: Merged v2 config file path
+        required: true
+        default: config/copilot-finops.yml
+        type: string
+      issue_number:
+        description: Copilot FinOps config-request issue number for TESTING ONLY (do not use for production); overrides config_file
+        required: false
+        type: string
+      dry_run:
+        description: Preview only (no changes applied)
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    # Single daily live reconcile of the merged config (budgets + members).
+    - cron: '37 4 * * *'
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  # ── 1. Resolve + validate the merged config ONCE, then hand it off ──────────
+  resolve:
+    name: 🔍 Resolve config
+    runs-on: ubuntu-24.04
+    outputs:
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🔍 Resolve config
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/resolve-copilot-finops-config.sh \
+            --config-file "${{ inputs.config_file || 'config/copilot-finops.yml' }}" \
+            --issue-number "${{ inputs.issue_number || '' }}"
+
+      - name: 📦 Install schema validator
+        run: pipx install check-jsonschema
+
+      - name: ✅ Validate config
+        run: |
+          scripts/validate-config.sh "$COPILOT_FINOPS_CONFIG_FILE" "$COPILOT_FINOPS_CONFIG_TYPE"
+
+      - name: 📤 Stage resolved config
+        run: cp "$COPILOT_FINOPS_CONFIG_FILE" copilot-finops.resolved.yml
+
+      - name: 📤 Upload resolved config
+        uses: actions/upload-artifact@v7
+        with:
+          name: copilot-finops-resolved-config
+          path: copilot-finops.resolved.yml
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: 🧮 Compute job outputs
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # Scheduled runs reconcile live; manual runs honor the dry_run input.
+          DRY_RUN="true"
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            DRY_RUN="false"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && -n "$INPUT_DRY_RUN" ]]; then
+            DRY_RUN="$INPUT_DRY_RUN"
+          fi
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+
+  # ── 2a. Apply budget policies (parallel) ────────────────────────────────────
+  apply-budgets:
+    name: 💰 Apply budget policies
+    needs: resolve
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.COPILOT_FINOPS_TOKEN || github.token }}
+      BUDGET_SUMMARY_FILE: budget-summary.jsonl
+      DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
+      CONFIG_FILE: copilot-finops.resolved.yml
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+
+      - name: 📥 Download resolved config
+        uses: actions/download-artifact@v7
+        with:
+          name: copilot-finops-resolved-config
+
+      - name: 📦 Install schema validator
+        run: pipx install check-jsonschema
+
+      - name: 🚀 Apply budget policies
+        id: apply
+        run: |
+          scripts/apply-user-budgets.sh \
+            --config-file "$CONFIG_FILE" \
+            --dry-run "$DRY_RUN" | tee apply.log
+
+      - name: 📝 Write job summary
+        if: always()
+        run: |
+          jsonl="${BUDGET_SUMMARY_FILE:-budget-summary.jsonl}"
+          log=apply.log
+
+          {
+            echo "## Apply user budgets"
+            echo
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "**Mode:** dry-run (preview only — no changes applied)"
+            else
+              echo "**Mode:** live (changes applied)"
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -s "$jsonl" ]]; then
+            jq -rs -f .github/summary/apply-summary.jq "$jsonl" | tee rendered-budget-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No policy results were captured — the apply step may have failed before reconciling, or the config has no budget policies. See the log below._" | tee rendered-budget-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo
+            echo "<details><summary>Full run log</summary>"
+            echo
+            echo '```'
+            if [[ -f "$log" ]]; then cat "$log"; else echo "(no log captured)"; fi
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2b. Sync cost center members (parallel) ─────────────────────────────────
+  sync-members:
+    name: 👥 Sync cost center members
+    needs: resolve
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.COPILOT_FINOPS_TOKEN || github.token }}
+      SYNC_SUMMARY_FILE: sync-summary.jsonl
+      DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
+      CONFIG_FILE: copilot-finops.resolved.yml
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v6
+
+      - name: 📥 Download resolved config
+        uses: actions/download-artifact@v7
+        with:
+          name: copilot-finops-resolved-config
+
+      - name: 📦 Install schema validator
+        run: pipx install check-jsonschema
+
+      - name: 🔄 Sync members
+        id: sync
+        run: |
+          scripts/sync-cost-center-members.sh \
+            --config-file "$CONFIG_FILE" \
+            --dry-run "$DRY_RUN" | tee sync.log
+
+      - name: 📝 Write job summary
+        if: always()
+        run: |
+          jsonl="${SYNC_SUMMARY_FILE:-sync-summary.jsonl}"
+          log=sync.log
+
+          {
+            echo "## Sync cost center members"
+            echo
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "**Mode:** dry-run (preview only — no changes applied)"
+            else
+              echo "**Mode:** live (changes applied)"
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -s "$jsonl" ]]; then
+            jq -rs -f .github/summary/sync-summary.jq "$jsonl" | tee rendered-sync-summary.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -f "$log" ]] && grep -q 'Sync completed' "$log"; then
+            echo "All mappings are already in sync — no membership changes." | tee rendered-sync-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No membership results were captured — the sync step may have failed before running, or the config has no mappings. See the log below._" | tee rendered-sync-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          {
+            echo
+            echo "<details><summary>Full run log</summary>"
+            echo
+            echo '```'
+            if [[ -f "$log" ]]; then cat "$log"; else echo "(no log captured)"; fi
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,13 @@
+# Public-safe starter config (v2 unified).
+# Replace your-enterprise and add policies/mappings in your private fork before applying.
+# See config/copilot-finops.example.yml for a worked example of every scope and both mapping modes.
+
+# Config schema version. REQUIRED for v2 so validation routes to schemas/v2/. See schemas/README.md.
+version: 2
+enterprise_slug: your-enterprise
+
+# AI-credit spend policies (budgets). Keep empty until you are ready to create or update budgets.
+ai_credit_spend_policies: []
+
+# Team -> cost center membership syncs. Keep empty if you do not run membership sync.
+team_cost_center_mappings: []

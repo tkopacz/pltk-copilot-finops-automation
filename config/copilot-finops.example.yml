@@ -1,0 +1,200 @@
+# Example unified Copilot FinOps config (v2).
+#
+# v2 merges the two v1 files (config/budget-policies.yml + config/cost-center-members.yml)
+# into this ONE file and renames the vocabulary. This file intentionally shows every
+# supported shape. Both lists are OPTIONAL — write only what you need. For a no-op:
+#
+#   version: 2
+#   enterprise_slug: your-enterprise
+#
+# (Add ai_credit_spend_policies and/or team_cost_center_mappings as needed.)
+
+# Config schema version. REQUIRED for v2 so validation routes to schemas/v2/. See schemas/README.md.
+version: 2
+
+# Enterprise slug can be defined here and/or passed from the workflow input.
+# Precedence: --enterprise-slug (CLI/workflow) > per-entry enterprise: > this top-level value.
+enterprise_slug: your-enterprise
+
+# Copilot usage-based billing is metered in AI credits. Each license includes a pooled allotment of
+# AI credits; once the pool is exhausted, additional usage is metered and capped by the budgets
+# below. Do not set a product SKU or budget type — the scripts default to ai_credits (BundlePricing).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ai_credit_spend_policies[]  ->  GA budget_scope
+# ─────────────────────────────────────────────────────────────────────────────
+#   scope: all_users    -> multi_user_customer  (default per-user budget; always hard-stop)
+#   scope: enterprise   -> enterprise           (enterprise-wide metered/additional cap)
+#   scope: user         -> user                 (one budget per login in `users`; `users` required; always hard-stop)
+#   scope: cost_center  -> cost_center          (one named cost center; cost_center required)
+#   scope: team         -> applied to each team in `teams`, by `credit_scope`:
+#       credit_scope: pool_then_metered  -> one user budget per member, unioned across the teams (always hard-stop)
+#       credit_scope: metered_only       -> one cost center budget per team (collective metered/additional spend)
+#   scope: organization -> materialized from an org's membership, by `credit_scope`:
+#       credit_scope: pool_then_metered  -> one user budget per org member (always hard-stop)
+#       credit_scope: metered_only       -> one org-scope budget (collective metered/additional spend)
+#
+# Enterprise vs org team: set `organization:` for an org team source; omit it for an enterprise
+# team (the enterprise is inferred). `enterprise:` and `organization:` are mutually exclusive.
+#
+# Parent -> write endpoint: an entry whose parent is an org (scope: organization, which requires
+# `organization:`) is written on the org billing endpoint
+# (/organizations/{org}/settings/billing/budgets); everything else uses the enterprise endpoint.
+# Cost-center budgets stay on the enterprise endpoint (the org budgets API has no cost_center scope).
+#
+# Conflicts: GHE forbids duplicate budgets for one entity. If the same login would get an individual
+# user budget from two or more policies (scope: user logins and/or team/organization pool_then_metered
+# members), the LAST policy in this file wins; earlier ones are skipped and the collision is flagged
+# in the run summary.
+#
+# Flattened fields: `amount` (whole USD, required), `stop_at_limit` (default true; forced true for
+# all_users and team/organization + credit_scope: pool_then_metered), `alert_admins` (default [];
+# non-empty enables alerting). Only `scope` and `amount` are always required.
+
+ai_credit_spend_policies:
+  # ── all_users: default per-user budget for everyone (always hard-stop) ───────
+  - name: budget-all-users-default
+    scope: all_users
+    description: Default per-user AI-credit budget for all licensed users (overridden per-user by the team policies below).
+    amount: 30
+
+  # ── enterprise: cap total metered (additional) spend after the shared pool ───
+  - name: budget-ent-your-enterprise-total
+    scope: enterprise
+    description: Enterprise-wide cap on total Copilot metered (additional) AI-credit spend.
+    amount: 5000
+    # Omit stop_at_limit to hard-stop (default true); set false to alert only.
+    alert_admins:
+      - your-billing-admin
+
+  # ── cost_center: alert-only metered cap for a named cost center ──────────────
+  - name: budget-cc-platform-engineering
+    scope: cost_center
+    description: Metered (additional) spend cap for the platform engineering cost center.
+    # Cost center name (resolved to its ID / sent as budget_entity_name).
+    cost_center: cc-org-your-org-platform-engineering
+    amount: 200
+    stop_at_limit: false
+    alert_admins:
+      - your-copilot-admin
+
+  # ── user: one budget per login in the users list (always hard-stop) ──────────
+  # The simplest targeted budget: cap specific users. Each login in `users` gets
+  # its own hard-stop user budget (sent as the budget's `user` field). Written on
+  # the enterprise endpoint. If a team/organization pool_then_metered policy also
+  # budgets one of these logins, the last policy in the file wins (flagged in the
+  # run summary).
+  - name: budget-user-power-users
+    scope: user
+    description: Individual cap for one or more high-usage users.
+    users:
+      - your-power-user
+      - your-other-power-user
+    amount: 75
+
+  # ── team + credit_scope: pool_then_metered: one user budget per member ───────
+  # Org team (organization: set). Each current member gets a hard-stop user budget.
+  - name: budget-team-org-platform-engineering
+    scope: team
+    description: Per-member pool + metered cap for org team platform-engineering (one user budget each).
+    organization: your-org
+    teams:
+      - platform-engineering
+    credit_scope: pool_then_metered
+    amount: 100
+
+  # Enterprise team (no organization:). Same per-member behavior. Listing more
+  # than one team unions their members (deduped) before fanning out user budgets.
+  - name: budget-team-ent-copilot-champions
+    scope: team
+    description: Per-member pool + metered cap for the enterprise champions teams (one user budget each).
+    teams:
+      - copilot-champions
+      - copilot-early-adopters
+    credit_scope: pool_then_metered
+    amount: 150
+
+  # ── team + credit_scope: metered_only: one cost center budget per team ───────
+  # Explicit destination cost center; alert-only. The apply step also populates the
+  # cost center with the team's current members (additive) so the budget caps them.
+  # An explicit cost_center: is only allowed with a single team (with multiple
+  # teams each team uses its own derived cost center).
+  - name: budget-team-ent-ai-leads
+    scope: team
+    description: Collective metered-spend cap for enterprise team ai-leads (single cost center budget).
+    teams:
+      - ai-leads
+    credit_scope: metered_only
+    cost_center: cc-ent-your-enterprise-ai-leads
+    amount: 500
+    stop_at_limit: false
+
+  # No cost_center: -> the apply step derives cc-ent-your-enterprise-data-science,
+  # auto-creates it if missing, and adds the team's current members.
+  - name: budget-team-ent-data-science
+    scope: team
+    description: Collective metered-spend cap for enterprise team data-science (auto-created cost center).
+    teams:
+      - data-science
+    credit_scope: metered_only
+    amount: 300
+
+  # remove_extra_members: true ALSO prunes cost-center members who left the team
+  # (full sync). Allowed ONLY on team + credit_scope: metered_only, and only safe on
+  # a dedicated/team-owned cost center (e.g. the derived cc-org-your-org-ml-platform).
+  - name: budget-team-org-ml-platform
+    scope: team
+    description: Collective metered-spend cap for org team ml-platform with leaver pruning.
+    organization: your-org
+    teams:
+      - ml-platform
+    credit_scope: metered_only
+    amount: 250
+    stop_at_limit: false
+    remove_extra_members: true
+
+  # ── organization + credit_scope: metered_only: one org-scope budget ──────────
+  # Caps the whole org's collective metered spend with a single organization-scope
+  # budget (written on the org billing endpoint). No membership work, no cost center.
+  - name: budget-org-your-org-total
+    scope: organization
+    description: Collective metered-spend cap for the whole your-org organization.
+    organization: your-org
+    credit_scope: metered_only
+    amount: 4000
+    stop_at_limit: false
+    alert_admins:
+      - your-org-owner
+
+  # ── organization + credit_scope: pool_then_metered: per-member user budgets ──
+  # Like a team pool_then_metered, but across ALL members of the org: each org
+  # member gets an individual hard-stop user budget (written on the org billing endpoint).
+  - name: budget-org-your-org-per-member
+    scope: organization
+    description: Per-member pool + metered cap for every member of your-org.
+    organization: your-org
+    credit_scope: pool_then_metered
+    amount: 80
+
+# ─────────────────────────────────────────────────────────────────────────────
+# team_cost_center_mappings[]  ->  ongoing team -> cost center membership sync
+# ─────────────────────────────────────────────────────────────────────────────
+# Each mapping keeps a cost center populated from a team's current membership.
+#   remove_extra_members: true            -> strict reconcile (also removes leavers)
+#   remove_extra_members: false (default) -> additive (keeps manual/extra members)
+# As with budgets, `organization:` selects an org team source; omit it for an enterprise team.
+
+team_cost_center_mappings:
+  # Org team source, strict reconciliation.
+  - name: cc-org-your-org-platform-engineering
+    description: Keep org team platform-engineering exactly in sync with its cost center.
+    organization: your-org
+    team: platform-engineering
+    cost_center: cc-org-your-org-platform-engineering
+    remove_extra_members: true
+
+  # Enterprise team source, additive sync (omit remove_extra_members to keep extras).
+  - name: cc-ent-your-enterprise-ai-leads
+    description: Add enterprise team ai-leads members to its cost center without removing extras.
+    team: ai-leads
+    cost_center: cc-ent-your-enterprise-ai-leads

@@ -4,6 +4,11 @@ This project uses GitHub's GA **Budget and usage management** APIs for enhanced 
 
 All API calls are made with GitHub CLI (`gh api`) using the workflow token from `COPILOT_FINOPS_TOKEN` when present.
 
+> The API is the same across config versions; only the config vocabulary differs. The examples below
+> use the v2 vocab (`scope`/`credit_scope`/`users`/`teams`/`organization`/`cost_center`/`amount`/`stop_at_limit`/`alert_admins`).
+> The frozen v1 vocab maps onto the same endpoints and request fields — see
+> [schemas/README.md](../schemas/README.md#v1-schemas-frozen) for the v1 ↔ v2 map.
+
 ## Common Headers
 
 ```text
@@ -18,14 +23,14 @@ Script: `scripts/sync-cost-center-members.sh`
 
 Process:
 
-1. Validate `cost-center-members.yml`.
+1. Validate the config file.
 2. Resolve `enterprise_slug` from workflow input or config.
 3. Fetch source team members.
-4. Resolve `target.cost_center` display name to its active cost center ID.
+4. Resolve the `cost_center` name to its active cost center ID.
 5. Read current cost center user resources.
 6. Compare source team users with current cost center users.
 7. Add missing users.
-8. Remove extra users only when `sync.remove_extra_members: true`.
+8. Remove extra users only when `remove_extra_members: true`.
 
 Team member endpoints:
 
@@ -64,7 +69,7 @@ Script: `scripts/apply-user-budgets.sh`
 
 Process:
 
-1. Validate `budget-policies.yml`.
+1. Validate the config file.
 2. Resolve `enterprise_slug` from workflow input or config.
 3. List existing budgets once and cache them locally for reconciliation.
 4. Process each policy, or one policy when `--policy-name` is used.
@@ -136,13 +141,35 @@ Only mutable fields are patched. Identity fields such as scope, SKU, user, and c
 
 ### Budget Natural Keys
 
-| Policy type | Match key |
+| Policy scope | Match key |
 | --- | --- |
+| `all_users` | `budget_scope=multi_user_customer` + SKU |
 | `enterprise` | `budget_scope=enterprise` + SKU |
-| `universal` | `budget_scope=multi_user_customer` + SKU |
+| `user` | `budget_scope=user` + SKU + login (one per login in `users`) |
 | `cost_center` | `budget_scope=cost_center` + SKU + cost center name or ID |
-| `team` + `coverage: total_spend` | `budget_scope=user` + SKU + login |
-| `team` + `coverage: additional_spend` | Same as `cost_center` |
+| `team` + `credit_scope: pool_then_metered` | `budget_scope=user` + SKU + login (per member, unioned across `teams`) |
+| `team` + `credit_scope: metered_only` | Same as `cost_center` (one per team in `teams`) |
+| `organization` + `metered_only` | `budget_scope=organization` + SKU + org name (on the org endpoint) |
+| `organization` + `pool_then_metered` | `budget_scope=user` + SKU + login (on the org endpoint) |
+
+### Organization Budgets (v2 `scope: organization`)
+
+A `scope: organization` policy is written on the organization billing endpoint, not the enterprise
+one (its parent is the org). The org budgets API supports `organization`, `repository`,
+`multi_user_customer`, and `user` scopes — `user`/`multi_user_customer` only with `ai_credits` or
+`premium_requests`, which is what this automation uses — but **not** `cost_center`.
+
+```text
+GET    /organizations/{organization}/settings/billing/budgets
+POST   /organizations/{organization}/settings/billing/budgets
+GET    /organizations/{organization}/settings/billing/budgets/{budget_id}
+PATCH  /organizations/{organization}/settings/billing/budgets/{budget_id}
+DELETE /organizations/{organization}/settings/billing/budgets/{budget_id}
+```
+
+Org-scope create body (additional usage): `budget_scope: organization`, `budget_entity_name: <org>`.
+Per-member create body (total usage): `budget_scope: user`, `user: <login>`. Org membership is read
+from `GET /orgs/{org}/members`.
 
 ### Cost Centers During Budget Apply
 
@@ -163,10 +190,10 @@ Create cost center body:
 }
 ```
 
-For `team` policies with `coverage: additional_spend`:
+For `team` policies with `credit_scope: metered_only`:
 
-- If `target.cost_center` is set, the script resolves that name to an active cost center ID.
-- If `target.cost_center` is omitted, the script derives a name and creates the cost center if needed.
+- If `cost_center` is set, the script resolves that name to an active cost center ID.
+- If `cost_center` is omitted, the script derives a name and creates the cost center if needed.
 - The script adds current team members to the cost center so the budget applies to the intended users.
 - Ongoing removals are handled by the sync workflow when configured.
 

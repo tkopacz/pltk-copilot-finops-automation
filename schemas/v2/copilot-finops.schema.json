@@ -1,0 +1,662 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/copilot-finops-automation/schemas/v2/copilot-finops.schema.json",
+    "title": "Copilot FinOps unified config (v2)",
+    "description": "Schema for config/copilot-finops*.yml. v2 merges the two v1 files (budget-policies + cost-center-members) into one document and renames the vocabulary (scope/credit_scope, teams/users/organization/cost_center, amount/stop_at_limit/alert_admins). It validates structure, types, enums, typo protection (additionalProperties:false) AND the structural cross-field rules: per-scope required/forbidden fields, enterprise/organization mutual exclusivity, the credit_scope->stop_at_limit constraint, and the budget-policy baseline cardinality (a non-empty ai_credit_spend_policies must contain exactly one all_users policy, with at most one optional enterprise policy). The cardinality rule uses contains + minContains/maxContains, which is why this schema targets draft 2020-12 (v1 stays on draft-07). Both lists are optional (write only what you need); only version is required, and an empty/omitted policy list is a valid no-op. Runtime-only rules — enterprise slug resolution from CLI/entry/top-level (rule 9) and live cost center name->ID + team membership (rule L) — plus value defaulting (rule D) stay in scripts/validate-config.sh and the apply/sync scripts, not here. v1 remains frozen under schemas/v1/.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "version"
+    ],
+    "examples": [
+        {
+            "version": 2,
+            "enterprise_slug": "your-enterprise"
+        },
+        {
+            "version": 2,
+            "enterprise_slug": "your-enterprise",
+            "ai_credit_spend_policies": [
+                {
+                    "name": "budget-all-users-default",
+                    "scope": "all_users",
+                    "amount": 30
+                }
+            ],
+            "team_cost_center_mappings": [
+                {
+                    "name": "cc-org-your-org-platform-engineering",
+                    "organization": "your-org",
+                    "team": "platform-engineering",
+                    "cost_center": "cc-org-your-org-platform-engineering",
+                    "remove_extra_members": true
+                }
+            ]
+        }
+    ],
+    "properties": {
+        "version": {
+            "title": "Config version",
+            "description": "Config contract version. Required for v2 so scripts/validate-config.sh routes the file to schemas/v2/. v1 configs (version omitted or 1) keep validating against schemas/v1/.",
+            "const": 2
+        },
+        "enterprise_slug": {
+            "title": "Enterprise slug",
+            "description": "GitHub Enterprise slug. Optional here; may instead be passed via --enterprise-slug or a per-entry enterprise:. At least one must resolve at runtime (enforced by the apply/sync scripts, not this schema).",
+            "type": "string",
+            "minLength": 1,
+            "examples": [
+                "your-enterprise"
+            ]
+        },
+        "api": {
+            "title": "API endpoint overrides",
+            "description": "Advanced REST endpoint overrides. Leave unset for github.com; only set when proxying the GitHub API. Not shown in example configs by convention.",
+            "type": "object",
+            "additionalProperties": {
+                "type": "string"
+            },
+            "properties": {
+                "budgets_endpoint_template": {
+                    "title": "Budgets endpoint template",
+                    "description": "Template for listing and writing budgets. Supports placeholders such as {enterprise} and {org} depending on script context.",
+                    "type": "string",
+                    "examples": [
+                        "/enterprises/{enterprise}/settings/billing/budgets"
+                    ]
+                },
+                "cost_centers_list_endpoint_template": {
+                    "title": "Cost centers list endpoint template",
+                    "description": "Template for listing enterprise cost centers.",
+                    "type": "string",
+                    "examples": [
+                        "/enterprises/{enterprise}/settings/billing/cost-centers"
+                    ]
+                },
+                "cost_center_endpoint_template": {
+                    "title": "Cost center endpoint template",
+                    "description": "Template for reading or creating a single cost center by ID.",
+                    "type": "string",
+                    "examples": [
+                        "/enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}"
+                    ]
+                },
+                "cost_center_resource_endpoint_template": {
+                    "title": "Cost center resource endpoint template",
+                    "description": "Template for adding or removing cost-center user resources.",
+                    "type": "string",
+                    "examples": [
+                        "/enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}/resource"
+                    ]
+                }
+            }
+        },
+        "ai_credit_spend_policies": {
+            "title": "AI-credit spend policies",
+            "description": "List of AI-credit spend policies to reconcile. Optional — omit it (or use []) to skip budgets entirely. At most one enterprise policy is allowed (it is optional). When the list is non-empty it must also contain exactly one all_users policy (the required default). An empty/omitted list is a valid no-op.",
+            "type": "array",
+            "default": [],
+            "items": {
+                "$ref": "#/$defs/budgetPolicy"
+            },
+            "allOf": [
+                {
+                    "$comment": "At most one enterprise policy (optional). minContains:0 makes it optional; maxContains:1 caps it.",
+                    "contains": {
+                        "type": "object",
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "enterprise"
+                            }
+                        }
+                    },
+                    "minContains": 0,
+                    "maxContains": 1
+                },
+                {
+                    "$comment": "Exactly one all_users policy is required once the list is non-empty.",
+                    "if": {
+                        "type": "array",
+                        "minItems": 1
+                    },
+                    "then": {
+                        "contains": {
+                            "type": "object",
+                            "required": [
+                                "scope"
+                            ],
+                            "properties": {
+                                "scope": {
+                                    "const": "all_users"
+                                }
+                            }
+                        },
+                        "minContains": 1,
+                        "maxContains": 1
+                    }
+                }
+            ]
+        },
+        "team_cost_center_mappings": {
+            "title": "Team cost center mappings",
+            "description": "List of team -> cost center membership mappings. Optional — omit it (or use []) to skip member sync entirely.",
+            "type": "array",
+            "default": [],
+            "items": {
+                "$ref": "#/$defs/mapping"
+            }
+        }
+    },
+    "$defs": {
+        "budgetPolicy": {
+            "title": "AI-credit spend policy",
+            "description": "One budget policy to reconcile. The scope controls which identity fields are required or forbidden.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "scope",
+                "amount"
+            ],
+            "not": {
+                "required": [
+                    "enterprise",
+                    "organization"
+                ]
+            },
+            "properties": {
+                "name": {
+                    "title": "Policy name",
+                    "description": "Local label used in logs and the --policy-name filter. Never sent to the API.",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "budget-all-users-default",
+                        "budget-ent-your-enterprise-total",
+                        "budget-team-org-platform-engineering"
+                    ]
+                },
+                "description": {
+                    "title": "Description",
+                    "description": "Optional human-readable description.",
+                    "type": "string",
+                    "examples": [
+                        "Default per-user AI-credit budget for all licensed users."
+                    ]
+                },
+                "scope": {
+                    "title": "Budget scope",
+                    "description": "Budget scope: selects what the budget caps and how it materializes.",
+                    "oneOf": [
+                        {
+                            "const": "all_users",
+                            "title": "All users",
+                            "description": "Default per-user budget for every licensed user (multi_user_customer). Always hard-stop."
+                        },
+                        {
+                            "const": "enterprise",
+                            "title": "Enterprise",
+                            "description": "One enterprise-wide budget capping total metered spend after the shared pool. Optional; at most one per config."
+                        },
+                        {
+                            "const": "cost_center",
+                            "title": "Cost center",
+                            "description": "One named cost center budget. Requires cost_center."
+                        },
+                        {
+                            "const": "team",
+                            "title": "Team",
+                            "description": "Materialized from each listed team's membership; requires teams (one or more slugs) + credit_scope (pool_then_metered or metered_only). Written on the enterprise billing endpoint."
+                        },
+                        {
+                            "const": "organization",
+                            "title": "Organization",
+                            "description": "An org's budget, materialized from org membership; requires organization + credit_scope. Written on the org billing endpoint."
+                        },
+                        {
+                            "const": "user",
+                            "title": "User",
+                            "description": "One hard-stop budget for each login in the users list. Written on the enterprise billing endpoint."
+                        }
+                    ]
+                },
+                "enterprise": {
+                    "title": "Enterprise override",
+                    "description": "Per-entry enterprise slug override. Mutually exclusive with organization.",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "your-enterprise"
+                    ]
+                },
+                "organization": {
+                    "title": "Organization",
+                    "description": "Organization login. On scope: team its presence marks an org team membership source; on scope: organization it names the org the budget belongs to (and selects the org billing endpoint). Mutually exclusive with enterprise.",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "your-org"
+                    ]
+                },
+                "cost_center": {
+                    "title": "Cost center",
+                    "description": "Cost center name (resolved to its ID at apply time, sent as budget_entity_name). Required for scope: cost_center; an optional explicit destination for a single-team scope: team + credit_scope: metered_only policy (derived when omitted, and forbidden when more than one team is listed).",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "cc-org-your-org-platform-engineering",
+                        "cc-ent-your-enterprise-ai-leads"
+                    ]
+                },
+                "teams": {
+                    "title": "Teams",
+                    "description": "Bare team slugs (no ent: prefix); the policy is applied to each listed team. Required (one or more) for scope: team.",
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "examples": [
+                        [
+                            "platform-engineering"
+                        ],
+                        [
+                            "platform-engineering",
+                            "ai-leads"
+                        ]
+                    ]
+                },
+                "users": {
+                    "title": "Users",
+                    "description": "GitHub logins to budget; each login gets its own hard-stop user budget. Required (one or more) for scope: user. Not used by any other scope.",
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "examples": [
+                        [
+                            "octocat"
+                        ],
+                        [
+                            "octocat",
+                            "monalisa"
+                        ]
+                    ]
+                },
+                "credit_scope": {
+                    "title": "Credit scope",
+                    "description": "Which AI-credit spend a budget covers, for scope: team and scope: organization.",
+                    "oneOf": [
+                        {
+                            "const": "pool_then_metered",
+                            "title": "Pool then metered",
+                            "description": "One per-member user budget covering the shared pool then metered (additional) usage. Always hard-stop."
+                        },
+                        {
+                            "const": "metered_only",
+                            "title": "Metered only",
+                            "description": "Covers collective metered (additional) usage only — for team a cost center budget, for organization a single org-scope budget."
+                        }
+                    ]
+                },
+                "amount": {
+                    "title": "Amount",
+                    "description": "Budget cap in whole USD. Maps to budget_amount.",
+                    "type": "integer",
+                    "minimum": 0,
+                    "examples": [
+                        30,
+                        100,
+                        5000
+                    ]
+                },
+                "stop_at_limit": {
+                    "title": "Stop at limit",
+                    "description": "Hard-stop usage at the cap (maps to prevent_further_usage). Optional; defaults to true. Forced true for all_users and for team + credit_scope: pool_then_metered (per-member user budgets always hard-stop).",
+                    "type": "boolean",
+                    "default": true
+                },
+                "alert_admins": {
+                    "title": "Alert admins",
+                    "description": "Logins to alert when the budget is hit. Optional; defaults to []. A non-empty list enables alerting.",
+                    "type": "array",
+                    "default": [],
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "examples": [
+                        [
+                            "your-copilot-admin"
+                        ],
+                        [
+                            "billing-admin",
+                            "finops-lead"
+                        ]
+                    ]
+                },
+                "remove_extra_members": {
+                    "title": "Remove extra members",
+                    "description": "Only valid for scope: team + credit_scope: metered_only. true prunes cost-center members who left the team (full sync); false (default) is additive.",
+                    "type": "boolean",
+                    "default": false
+                }
+            },
+            "allOf": [
+                {
+                    "$comment": "Rule 1: cost_center policies require cost_center and forbid unrelated identity/sync fields.",
+                    "if": {
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "cost_center"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "cost_center"
+                        ],
+                        "properties": {
+                            "teams": false,
+                            "credit_scope": false,
+                            "organization": false,
+                            "remove_extra_members": false,
+                            "users": false
+                        }
+                    }
+                },
+                {
+                    "$comment": "Rule 4: enterprise policies forbid team/cost-center/org identity fields and sync-only fields.",
+                    "if": {
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "enterprise"
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "teams": false,
+                            "cost_center": false,
+                            "credit_scope": false,
+                            "organization": false,
+                            "remove_extra_members": false,
+                            "users": false
+                        }
+                    }
+                },
+                {
+                    "$comment": "Rule 3: all_users policies forbid identity fields and force stop_at_limit true.",
+                    "if": {
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "all_users"
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "teams": false,
+                            "cost_center": false,
+                            "credit_scope": false,
+                            "organization": false,
+                            "remove_extra_members": false,
+                            "users": false,
+                            "stop_at_limit": {
+                                "const": true
+                            }
+                        }
+                    }
+                },
+                {
+                    "$comment": "Rule 2: team policies require teams and credit_scope.",
+                    "if": {
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "team"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "teams",
+                            "credit_scope"
+                        ],
+                        "properties": {
+                            "users": false
+                        }
+                    }
+                },
+                {
+                    "$comment": "Rule 5: team + pool_then_metered materializes as per-member user budgets; no cost center or member pruning, always hard-stop.",
+                    "if": {
+                        "required": [
+                            "scope",
+                            "credit_scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "team"
+                            },
+                            "credit_scope": {
+                                "const": "pool_then_metered"
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "cost_center": false,
+                            "remove_extra_members": false,
+                            "stop_at_limit": {
+                                "const": true
+                            }
+                        }
+                    }
+                },
+                {
+                    "$comment": "Rule 7: organization policies require organization + credit_scope and never use team, cost_center, enterprise override, or member pruning.",
+                    "if": {
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "organization"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "organization",
+                            "credit_scope"
+                        ],
+                        "properties": {
+                            "teams": false,
+                            "cost_center": false,
+                            "enterprise": false,
+                            "remove_extra_members": false,
+                            "users": false
+                        }
+                    }
+                },
+                {
+                    "$comment": "Organization + pool_then_metered creates per-member user budgets and always hard-stops.",
+                    "if": {
+                        "required": [
+                            "scope",
+                            "credit_scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "organization"
+                            },
+                            "credit_scope": {
+                                "const": "pool_then_metered"
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "stop_at_limit": {
+                                "const": true
+                            }
+                        }
+                    }
+                },
+                {
+                    "$comment": "Rule 11: user policies require users, forbid every other identity/sync field, and force stop_at_limit true (user-level budgets always hard-stop).",
+                    "if": {
+                        "required": [
+                            "scope"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "user"
+                            }
+                        }
+                    },
+                    "then": {
+                        "required": [
+                            "users"
+                        ],
+                        "properties": {
+                            "teams": false,
+                            "cost_center": false,
+                            "credit_scope": false,
+                            "organization": false,
+                            "remove_extra_members": false,
+                            "stop_at_limit": {
+                                "const": true
+                            }
+                        }
+                    }
+                },
+                {
+                    "$comment": "team + metered_only with multiple teams fans out to one derived cost center per team, so an explicit cost_center is ambiguous and forbidden when more than one team is listed.",
+                    "if": {
+                        "required": [
+                            "scope",
+                            "credit_scope",
+                            "teams"
+                        ],
+                        "properties": {
+                            "scope": {
+                                "const": "team"
+                            },
+                            "credit_scope": {
+                                "const": "metered_only"
+                            },
+                            "teams": {
+                                "minItems": 2
+                            }
+                        }
+                    },
+                    "then": {
+                        "properties": {
+                            "cost_center": false
+                        }
+                    }
+                }
+            ]
+        },
+        "mapping": {
+            "title": "Team cost center mapping",
+            "description": "One ongoing team -> cost center membership sync mapping.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "team",
+                "cost_center"
+            ],
+            "not": {
+                "required": [
+                    "enterprise",
+                    "organization"
+                ]
+            },
+            "properties": {
+                "name": {
+                    "title": "Mapping name",
+                    "description": "Local label used in logs and the --mapping-name filter.",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "cc-org-your-org-platform-engineering",
+                        "cc-ent-your-enterprise-ai-leads"
+                    ]
+                },
+                "description": {
+                    "title": "Description",
+                    "description": "Optional human-readable description.",
+                    "type": "string",
+                    "examples": [
+                        "Keep org team platform-engineering exactly in sync with its cost center."
+                    ]
+                },
+                "enterprise": {
+                    "title": "Enterprise override",
+                    "description": "Per-entry enterprise slug override for an enterprise team source. Mutually exclusive with organization.",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "your-enterprise"
+                    ]
+                },
+                "organization": {
+                    "title": "Organization",
+                    "description": "Organization login for an org team source. Mutually exclusive with enterprise.",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "your-org"
+                    ]
+                },
+                "team": {
+                    "title": "Team",
+                    "description": "Source team slug (bare, no ent: prefix).",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "platform-engineering",
+                        "ai-leads"
+                    ]
+                },
+                "cost_center": {
+                    "title": "Cost center",
+                    "description": "Destination cost center name (resolved to its ID at sync time).",
+                    "type": "string",
+                    "minLength": 1,
+                    "examples": [
+                        "cc-org-your-org-platform-engineering",
+                        "cc-ent-your-enterprise-ai-leads"
+                    ]
+                },
+                "remove_extra_members": {
+                    "title": "Remove extra members",
+                    "description": "true = strict reconcile (remove cost-center members no longer in the team); false (default) = additive.",
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        }
+    }
+}

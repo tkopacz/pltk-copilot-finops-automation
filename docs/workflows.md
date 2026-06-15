@@ -11,17 +11,42 @@ For a new public fork, keep the default starter configs empty until you are read
 
 Disable scheduled runs in public demo repositories that are not connected to a real enterprise. Scheduled sync/apply runs are live once enabled, and job summaries and audit artifacts can expose operational details once real config is added.
 
-All workflows run on `ubuntu-24.04`. The GitHub-hosted Ubuntu 24.04 runner image already includes Bash 5.2, GitHub CLI, `jq`, and `yq`, which are the tools these scripts need.
+All workflows run on `ubuntu-24.04`. The GitHub-hosted Ubuntu 24.04 runner image already includes Bash 5.2, GitHub CLI, `jq`, and `yq`, which are the tools these scripts need. Each workflow also installs `check-jsonschema` for the JSON Schema validation step.
 
 ## Config Inputs
 
-The primary path is file-based config reviewed through pull requests. Apply and sync also support optional issue-based config for test/request scenarios:
+The primary path is file-based config reviewed through pull requests. All workflows default to the v2 merged file (`config/copilot-finops.yml`). The per-type workflows also accept a unified `config_file` input and a legacy `*_config_file` input that still accepts a v1 split file (deprecated — the resolve scripts emit a deprecation notice). The per-type workflows are file-based only — issue-based testing goes through the unified workflow (see below):
 
-| Workflow | File input | Issue config input |
+| Workflow | Unified input | Legacy file input |
 | --- | --- | --- |
-| Sync cost center members | `cost_center_members_config_file` | `cost_center_members_issue_number` |
-| Apply user budgets | `budget_policies_config_file` | `budget_policies_issue_number` |
-| Audit Copilot budget state | both file inputs | none |
+| Sync cost center members | `config_file` | `cost_center_members_config_file` |
+| Apply user budgets | `config_file` | `budget_policies_config_file` |
+| Audit Copilot budget state | `config_file` | both file inputs |
+
+The resolve scripts detect the file's `version` and emit the validate-config type (`all` for v2, `budgets`/`teams` for v1) that the workflow validate step uses.
+
+### Unified workflow (v2 merged config)
+
+`apply-copilot-finops.yml` is the recommended path for the v2 merged config. Instead of separate
+apply and sync runs, it resolves `config/copilot-finops.yml` once and fans out:
+
+```mermaid
+flowchart TD
+  R["resolve<br/>parse + validate once (all) · compute dry_run · upload artifact"]
+  R --> A["apply-budgets (parallel)<br/>apply-user-budgets.sh + detailed summary"]
+  R --> S["sync-members (parallel)<br/>sync-cost-center-members.sh + detailed summary"]
+```
+
+- **One parse/extract job:** `resolve` runs `scripts/resolve-copilot-finops-config.sh` (file or
+  budget/members issue), validates the merged config with type `all`, computes `dry_run`
+  (schedule -> live, dispatch -> input), and uploads the resolved file as a 1-day artifact.
+- **Two parallel jobs:** `apply-budgets` and `sync-members` both `needs: resolve` (not each other),
+  download the artifact, and run their scripts against the same resolved file. Each writes its own
+  detailed `$GITHUB_STEP_SUMMARY` via `apply-summary.jq` / `sync-summary.jq` plus a collapsible log.
+- **v2 only:** the resolver rejects a v1 file with a clear message; use the per-type workflows for v1.
+- **Testing-only issue input:** the unified workflow is file-based (the enterprise slug and policies come from the config). An optional `issue_number` resolves config from the `Copilot FinOps config request` issue (label `copilot-finops-config`) for testing only (schedules never set it). A merged config with one omitted list simply makes that job a friendly no-op.
+- **Parallel tradeoff:** apply and sync run concurrently (both idempotent; apply self-populates cost
+  centers for metered-only team budgets), so there is no enforced sync-before-apply ordering.
 
 When an issue number is provided, the workflow extracts the config YAML from the matching issue form, writes it to a temporary file on the runner, validates that file, and passes the temporary file path to the existing scripts. The script CLI flags stay stable (`--config-file`, `--teams-config-file`, and `--budgets-config-file`). For production changes, prefer config files reviewed through the repository.
 
@@ -31,9 +56,11 @@ Each workflow also writes the resolved config source and full YAML content to th
 
 | Script | Purpose |
 | --- | --- |
-| `scripts/resolve-budget-policies-config.sh` | Resolves budget config from a file or config request issue and writes workflow env/summary metadata. |
-| `scripts/resolve-cost-center-members-config.sh` | Resolves cost center sync config from a file or config request issue and writes workflow env/summary metadata. |
-| `scripts/validate-config.sh` | Checks config shape before any API calls. |
+| `scripts/resolve-budget-policies-config.sh` | Resolves budget config from a file and writes workflow env/summary metadata (file-based; per-type workflow). |
+| `scripts/resolve-cost-center-members-config.sh` | Resolves cost center sync config from a file and writes workflow env/summary metadata (file-based; per-type workflow). |
+| `scripts/resolve-copilot-finops-config.sh` | Resolves the merged v2 config from a file or the unified `Copilot FinOps config request` issue (one normalized `COPILOT_FINOPS_*` env set), for the unified workflow. |
+| `scripts/migrate-v1-to-v2.sh` | One-shot migration aid: converts a v1 budgets + members pair into the merged v2 config (stdout or `--output`). |
+| `scripts/validate-config.sh` | Validates config against the versioned JSON Schema (`schemas/v<N>/`) and the semantic cross-field rules before any API calls. |
 | `scripts/audit-copilot-budget-state.sh` | Writes a markdown report under `reports/`. |
 | `scripts/sync-cost-center-members.sh` | Reconciles team members into cost centers. |
 | `scripts/apply-user-budgets.sh` | Creates or updates budgets without deleting extras. |
@@ -44,8 +71,8 @@ For the exact API sequence and request bodies used by these scripts, see [API re
 
 - Triggers: manual + daily schedule at 03:17 UTC.
 - Scheduled runs use file-based config and force `dry_run=false` to reconcile live cost center membership.
-- If you do not use cost center member sync, keep the config file present with `mappings: []`.
-- Reads team membership from either an org team (`source.org`) or enterprise team (`source.enterprise`).
+- If you do not use cost center member sync, keep the config present with `team_cost_center_mappings: []` (v2) or `mappings: []` (v1).
+- Reads team membership from either an org team (`organization:` set) or an enterprise team (no `organization:`; the enterprise is inferred).
 - Resolves the target cost center name to its GA cost center **ID**, then reconciles members:
   - Reads current members from the cost center's `resources[]` array.
   - Adds members via `POST .../cost-centers/{cost_center_id}/resource` (body `{"users":[...]}`).
@@ -57,59 +84,130 @@ For the exact API sequence and request bodies used by these scripts, see [API re
 - Triggers: manual + daily schedule at 04:47 UTC, after the cost center member sync schedule.
 - Scheduled runs use file-based config and force `dry_run=false` to reconcile live budget policy state after member sync.
 - Creates budgets with the GA endpoint `POST /enterprises/{enterprise}/settings/billing/budgets`.
-- Processes budget policy types from config, each mapping to a GA `budget_scope`:
+- Processes budget policies from config, each mapping to a GA `budget_scope` (v2 `scope` shown; v1 `type` in parentheses):
   - `enterprise` → `budget_scope: enterprise` — caps total enterprise metered spend after the shared pool.
-  - `universal` → `budget_scope: multi_user_customer` — default user-level budget for all licensed users.
-  - `cost_center` → `budget_scope: cost_center` — caps a single cost center's metered spend (identified by `target.cost_center`, sent as `budget_entity_name`).
-  - `team` → materialized from a team's membership in one of two ways, selected by `coverage`:
-    - `coverage: total_spend` (default) → `budget_scope: user` — caps **shared pool + additional** spend by applying an individual user-level budget to each team member (overrides the universal default; always hard-stop).
-    - `coverage: additional_spend` → `budget_scope: cost_center` — caps the team's **collective additional (metered)** spend with a single cost center budget. The apply step also **populates the cost center with the team's current members** (additive) so the budget caps the right people; `target.cost_center` is optional (when omitted, a name is derived as `cc-ent-{enterprise}-{team}` / `cc-org-{org}-{team}` and the cost center is **auto-created** if missing). Ongoing reconciliation (incl. removals) is handled by the sync-cost-center-members workflow. Hard stop optional.
-- Copilot metered usage uses product SKU `ai_credits`. User-level budgets (`universal`, and `team` with `coverage: total_spend`) always hard-stop, so `prevent_further_usage` must be `true`.
+  - `all_users` (v1 `universal`) → `budget_scope: multi_user_customer` — default user-level budget for all licensed users.
+  - `user` → `budget_scope: user` — one hard-stop budget per login in `users:`, on the enterprise endpoint.
+  - `cost_center` → `budget_scope: cost_center` — caps a single cost center's metered spend (identified by `cost_center`, sent as `budget_entity_name`).
+  - `team` → applied to each team in `teams:`, materialized in one of two ways, selected by `credit_scope` (v1 `coverage`):
+    - `pool_then_metered` (v1 `total_spend`) → `budget_scope: user` — caps **shared pool + metered** spend by applying an individual user-level budget to each team member (members are unioned + deduped across the listed teams; overrides the all-users default; always hard-stop).
+    - `metered_only` (v1 `additional_spend`) → `budget_scope: cost_center` — caps each listed team's **collective metered** spend with one cost center budget per team. The apply step also **populates each cost center with that team's current members** (additive) so the budget caps the right people; `cost_center` is optional and only allowed with a single team (when omitted, or with multiple teams, a name is derived as `cc-ent-{enterprise}-{team}` / `cc-org-{org}-{team}` and the cost center is **auto-created** if missing). Ongoing reconciliation (incl. removals) is handled by the sync-cost-center-members workflow. Hard stop optional.
+  - `organization` → an org's budget, **written on the org billing endpoint** `POST /organizations/{org}/settings/billing/budgets` (its parent is the org). Dual-track like a team, by `credit_scope`:
+    - `pool_then_metered` → `budget_scope: user` per org member (read from `/orgs/{org}/members`; always hard-stop).
+    - `metered_only` → one `budget_scope: organization` budget for the org's collective metered spend (no cost center).
+- **Conflicts:** GHE forbids duplicate budgets for one entity. A read-only pre-flight flags any login individually budgeted by 2+ policies (a `scope: user` login and/or a team/organization `pool_then_metered` member); the **last policy in config order wins**, earlier ones are skipped, and every collision is shown in a Conflicts section of the job summary (user-vs-cost-center overlaps are flagged as informational).
+- Copilot metered usage uses product SKU `ai_credits`. User-level budgets (`all_users`, and `team`/`organization` with the `pool_then_metered` track) always hard-stop, so `prevent_further_usage` must be `true`.
 - Dry-run prints the exact JSON payloads without calling the API.
 
-### Issue-based config testing
+### Policy scope → GHE budget (implementation)
 
-Use issue-based config for test/request scenarios when you want the workflow to evaluate config from an issue:
+These diagrams show how `scripts/apply-user-budgets.sh` technically turns one config policy into one
+or more GitHub Enterprise (GHE) budgets, so you can see exactly what the apply step will do before it
+runs. They map a policy's `scope` (and `credit_scope`) to the resolved **billing endpoint**, the GHE
+**`budget_scope`**, and the **entity field** sent in the request body.
 
-- `apply-user-budgets.yml` accepts `budget_policies_issue_number` from the `Budget policy config request` issue form.
-- `sync-cost-center-members.yml` accepts `cost_center_members_issue_number` from the `Cost center members config request` issue form.
-- The issue must be open and have the expected label (`budget-policy-config` or `cost-center-members-config`).
-- The workflow extracts the fenced YAML from the issue form field and writes it to `$RUNNER_TEMP`.
-- The workflow comments the run result back to the issue.
+#### 1. Scope → endpoint + budget_scope + entity field
 
-Issue content can be edited after creation. For this reason, issue-based runs record the issue `updatedAt` timestamp and SHA-256 hash of the extracted YAML in the summary and issue comment.
+```mermaid
+flowchart TD
+  CFG["Policy in config<br/>scope + amount + (credit_scope)"] --> SC{"scope?"}
 
-Issue-based config can be used with `dry_run=false`, but reviewed config files remain the recommended production path. If you use issue-based config for a live run, review the issue content, timestamp, SHA-256 hash, and workflow summary carefully before running.
+  SC -->|all_users| AU["budget_scope: multi_user_customer<br/>(no entity field)<br/>always hard-stop"]
+  SC -->|enterprise| EN["budget_scope: enterprise<br/>(no entity field)"]
+  SC -->|user| US["budget_scope: user &times; N<br/>user = login (hard-stop)"]
+  SC -->|cost_center| CCM["resolve cost_center name &rarr; ID<br/>budget_scope: cost_center<br/>budget_entity_name = cc ID"]
+  SC -->|team| TM{"credit_scope?"}
+  SC -->|organization| OR{"credit_scope?"}
 
-#### Scenario: test budget policies from an issue
+  TM -->|pool_then_metered| TU["union team members<br/>budget_scope: user &times; N<br/>user = login (hard-stop)"]
+  TM -->|metered_only| TC["per team: ensure + populate cost center<br/>budget_scope: cost_center<br/>budget_entity_name = cc ID"]
 
-Use this when someone wants to preview a budget policy change without creating a branch or editing the repo config.
+  OR -->|pool_then_metered| OU["read org members<br/>budget_scope: user &times; N<br/>user = login (hard-stop)"]
+  OR -->|metered_only| OO["budget_scope: organization<br/>budget_entity_name = org login"]
 
-1. Create a new issue using the `Budget policy config request` issue form.
-2. Paste a complete budget policy config into the `Budget policies YAML` field.
-3. Do not assign the issue to Copilot or any coding agent. The issue is structured workflow input, not an implementation task.
-4. Run `Apply user budgets` manually.
-5. Set `budget_policies_issue_number` to the issue number.
-6. Keep `dry_run=true` for previews. Use file-based config for normal live applies.
-7. Review the job summary and the comment posted back to the issue.
+  AU --> EEP["POST /enterprises/&#123;enterprise&#125;/settings/billing/budgets"]
+  EN --> EEP
+  US --> EEP
+  CCM --> EEP
+  TU --> EEP
+  TC --> EEP
 
-The workflow enforces that the issue is open and has the `budget-policy-config` label before extracting YAML. It writes the extracted YAML to `$RUNNER_TEMP/budget-policies.yml`, validates it, and calls `scripts/apply-user-budgets.sh --config-file ...` with the workflow's selected `dry_run` value.
+  OU --> OEP["POST /organizations/&#123;org&#125;/settings/billing/budgets"]
+  OO --> OEP
+```
 
-#### Scenario: test cost center member sync from an issue
+Every request body also carries `budget_amount` (whole USD), `budget_product_sku: ai_credits`,
+`budget_type: BundlePricing`, `prevent_further_usage` (the hard-stop), and `budget_alerting`
+(`will_alert` + `alert_recipients`). Only `cost_center`/`team metered_only` send `budget_entity_name`
+(a cost center); only `organization metered_only` sends `budget_entity_name` (the org login); only
+the per-member tracks and `scope: user` send `user`.
 
-Use this when someone wants to preview team-to-cost-center membership changes without editing the repo config.
+#### 2. Reconciliation — how apply decides CREATE / UPDATE / no change
 
-1. Create a new issue using the `Cost center members config request` issue form.
-2. Paste a complete cost center member sync config into the `Cost center members YAML` field.
-3. Do not assign the issue to Copilot or any coding agent. The issue is structured workflow input, not an implementation task.
-4. Run `Sync cost center members` manually.
-5. Set `cost_center_members_issue_number` to the issue number.
-6. Keep `dry_run=true` for previews. Use file-based config for normal live syncs.
-7. Review the job summary and the comment posted back to the issue.
+GHE budgets have no name field, so the apply step matches **desired vs. live** state by natural key.
+It lists existing budgets once per endpoint, then for each materialized budget:
 
-The workflow enforces that the issue is open and has the `cost-center-members-config` label before extracting YAML. It writes the extracted YAML to `$RUNNER_TEMP/cost-center-members.yml`, validates it, and calls `scripts/sync-cost-center-members.sh --config-file ...` with the workflow's selected `dry_run` value.
+```mermaid
+flowchart TD
+  M["Each materialized budget"] --> L["List existing budgets once<br/>(cached per endpoint)"]
+  L --> K["Match by natural key:<br/>budget_scope + product_sku<br/>+ (user | budget_entity_name)"]
+  K --> Q{"Match found?"}
+  Q -->|No| CR["CREATE<br/>POST .../budgets"]
+  Q -->|Yes| D{"amount / hard-stop /<br/>alerting differ?"}
+  D -->|Yes| PA["UPDATE mutable fields only<br/>PATCH .../budgets/&#123;id&#125;"]
+  D -->|No| NC["No change (idempotent)"]
+  CR --> SUM["Recorded in the job summary"]
+  PA --> SUM
+  NC --> SUM
+```
 
-Issue-based runs are useful for experiments and review conversations. Production applies should still use file-based config reviewed through the repository.
+> The apply step **never deletes** budgets. A budget removed from config is left in place; clean it up
+> manually with `DELETE .../budgets/{budget_id}` after review. In `dry_run=true` mode every branch is
+> computed and printed (`Would create` / `Would update` / `No change`) but no request is sent.
+
+#### 3. Dual-track materialization (team / organization membership expansion)
+
+`team` and `organization` policies fan a single config entry out across live membership. This is the
+step that turns one policy into N budgets:
+
+```mermaid
+sequenceDiagram
+  participant A as apply-user-budgets.sh
+  participant GH as GitHub API
+  Note over A: scope: team or organization
+  A->>GH: GET members (org team, enterprise team, or org)
+  GH-->>A: [login-1, login-2, ...]
+  alt credit_scope: pool_then_metered
+    loop each member login
+      A->>GH: upsert budget_scope=user (user=login, hard-stop)
+    end
+  else credit_scope: metered_only (team)
+    A->>GH: ensure cost center (resolve by name, create if missing)
+    A->>GH: add current team members to the cost center
+    A->>GH: upsert budget_scope=cost_center (budget_entity_name=cc)
+  else credit_scope: metered_only (organization)
+    A->>GH: upsert budget_scope=organization (budget_entity_name=org)
+  end
+```
+
+Membership sources: an org team reads `GET /orgs/{org}/teams/{team}/members`, an enterprise team
+reads `GET /enterprises/{enterprise}/teams/{team}/memberships`, and a `scope: organization` policy
+reads `GET /orgs/{org}/members`. For a `team metered_only` budget, the apply step populates the cost
+center additively; ongoing removals are handled by the sync-cost-center-members workflow.
+
+### Issue-based config testing (unified workflow)
+
+Issue-based config is for test/request scenarios; reviewed config files remain the recommended production path. There is one issue form, consumed only by the unified `apply-copilot-finops.yml` workflow:
+
+1. Create a new issue with the `Copilot FinOps config request` form (label `copilot-finops-config`).
+2. Paste one complete v2 config into the `Copilot FinOps config YAML` field. Populate `ai_credit_spend_policies` and/or `team_cost_center_mappings` — a list you omit just makes that half a no-op.
+3. Do not assign the issue to Copilot or any coding agent. It is structured workflow input, not an implementation task.
+4. Run `Apply Copilot FinOps` manually and set `issue_number` to the issue number. Keep `dry_run=true` for previews.
+5. Review both job summaries (budgets + members).
+
+The resolver enforces that the issue is open and carries the `copilot-finops-config` label, extracts the fenced YAML to `$RUNNER_TEMP/copilot-finops.yml`, validates it (`version: 2`), and runs both jobs against it. Because issue content can be edited after creation, the resolver records the issue `updatedAt` timestamp and the SHA-256 of the extracted YAML in the job summary, so a live issue-based run can be audited before trusting it.
+
+The per-type `apply-user-budgets.yml` and `sync-cost-center-members.yml` workflows are file-based only.
 
 ### Budget levels tree
 
@@ -118,16 +216,18 @@ flowchart TD
   A["Copilot AI-credit billing"] --> P["Shared AI-credit pool<br/>(included with licenses)"]
   A --> M["Metered usage<br/>$0.01 / AI credit after pool"]
 
-  A --> B["Enterprise policy<br/>type: enterprise<br/>scope: enterprise"]
-  A --> C["Universal user default<br/>type: universal<br/>scope: multi_user_customer"]
-  C --> D["Team override<br/>type: team"]
-  D --> Dt["coverage: total_spend<br/>scope: user (per member)"]
-  D --> Da["coverage: additional_spend<br/>scope: cost_center<br/>(auto-created + members added)"]
+  A --> B["Enterprise budget<br/>scope: enterprise"]
+  A --> C["All-users default<br/>scope: all_users"]
+  C --> U["Single-user override<br/>scope: user"]
+  C --> D["Team override<br/>scope: team"]
+  D --> Dt["credit_scope: pool_then_metered<br/>budget_scope: user (per member)"]
+  D --> Da["credit_scope: metered_only<br/>budget_scope: cost_center<br/>(auto-created + members added)"]
 
   B --> B1["Caps total enterprise metered spend<br/>(metered phase only)"]
   C --> C1["Every licensed user gets a default cap<br/>(pool + metered, always hard-stop)"]
-  Dt --> Dt1["Each member gets an individual cap on pool +<br/>metered, overriding the universal default"]
-  Da --> Da1["One cost center budget caps the team's<br/>collective metered (additional) spend;<br/>team members are added to the cost center"]
+  U --> U1["One named user gets an individual cap<br/>(pool + metered, always hard-stop),<br/>overriding the all-users default"]
+  Dt --> Dt1["Each member gets an individual cap on pool +<br/>metered, overriding the all-users default"]
+  Da --> Da1["One cost center budget caps the team's<br/>collective metered spend;<br/>team members are added to the cost center"]
 ```
 
 ### Where each control applies (pool vs metered)
@@ -135,7 +235,7 @@ flowchart TD
 ```mermaid
 flowchart LR
   subgraph Pool["Shared pool phase"]
-    U1["User-level budgets<br/>(universal + individual)"]
+    U1["User-level budgets<br/>(all-users default + individual)"]
   end
   subgraph Metered["Metered phase (after pool)"]
     U2["User-level budgets<br/>(still enforced)"]

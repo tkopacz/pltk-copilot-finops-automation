@@ -1,0 +1,48 @@
+name: Copilot FinOps config request
+description: Request a workflow run using a unified Copilot FinOps config (v2) pasted into this issue.
+title: "[Copilot FinOps config]: "
+labels:
+  - copilot-finops-config
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to test a unified Copilot FinOps config (`version: 2`) through the **Apply Copilot FinOps** workflow. Config files reviewed through pull requests remain the recommended production path.
+
+        Paste one complete merged config. Populate `ai_credit_spend_policies` and/or `team_cost_center_mappings` — both are optional, so include only what you want this run to act on. The workflow applies budgets and syncs cost center members in parallel from the same document; a list you leave out simply makes that half a no-op.
+
+  - type: textarea
+    id: copilot_finops_yaml
+    attributes:
+      label: Copilot FinOps config YAML
+      description: Paste a complete v2 merged Copilot FinOps config. The workflow validates this YAML and uses it as the single config source for both the budget apply and the member sync.
+      render: yaml
+      placeholder: |
+        version: 2
+        enterprise_slug: your-enterprise
+
+        ai_credit_spend_policies:
+          - name: budget-all-users-default
+            scope: all_users
+            amount: 50
+
+        team_cost_center_mappings:
+          - name: cc-org-your-org-platform-engineering
+            organization: your-org
+            team: platform-engineering
+            cost_center: cc-org-your-org-platform-engineering
+            remove_extra_members: true
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I understand file-based config reviewed through pull requests (config as code) is recommended over issue-based config, which is for requests and testing.
+          required: true
+        - label: I understand issue-based config and config files are both visible to anyone with read access to this repository, so the enterprise, organization, team, cost center, user, and budget details in this issue are not private.
+          required: true
+        - label: I will not assign this issue to GitHub Copilot or any other coding agent. It is structured input for a GitHub Actions workflow, not an implementation task.
+          required: true
